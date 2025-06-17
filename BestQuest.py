@@ -230,9 +230,11 @@ class BestQuest:
                     await click_window_by_path(self.client, dungeon_warning_path)
 
                 logger.info("Waiting for zone change after entering sigil...")
-                while await self.client.is_loading():
+                while not await self.client.is_loading():
                     await asyncio.sleep(0.2)
                 logger.success("Entered dungeon.")
+                while await self.client.is_loading():
+                    await asyncio.sleep(0.2)
                 return True
         return False
 
@@ -503,7 +505,6 @@ async def main():
         client = handler.get_new_clients()[0]
         logger.success("Client found. Activating hooks...")
         await client.activate_hooks()
-        await asyncio.sleep(2.0)
 
         db_logger = QuestDatabase()
         best_quest = BestQuest(client, [], db_logger)
@@ -512,11 +513,9 @@ async def main():
         while True:
             if keyboard.is_pressed('space'):
                 await best_quest.run()
-                await asyncio.sleep(0.5)
             if keyboard.is_pressed('1'):
                 logger.info("Exit key pressed. Shutting down.")
                 break
-            await asyncio.sleep(0.1)
 
     except IndexError:
         logger.error("No Wizard101 client found.")

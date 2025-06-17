@@ -33,3 +33,6 @@ _ReSharper*/
 packages/
 __pycache__/
 /BestQuestLogs.txt
+/claude tips/
+/calculated_collisions/
+/images
