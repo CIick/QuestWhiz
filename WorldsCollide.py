@@ -17,7 +17,7 @@ from wizwalker.memory import DynamicClientObject, ActorBody
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, nearest_points
 
-from src.utils import is_free
+from utils import is_free
 
 # DEV flag to control destructive actions like deleting directories
 DEV_MODE = True
@@ -28,8 +28,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPoly
 
 from wizwalker import Client, ClientHandler, XYZ
-from src.collision import get_collision_data, CollisionWorld, ProxyType
-from src.collision_math import toCubeVertices, transformCube
+from collision import get_collision_data, CollisionWorld, ProxyType
+from collision_math import toCubeVertices, transformCube
 
 
 # <editor-fold desc="Refactored Helper Functions">

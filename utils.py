@@ -5,7 +5,7 @@ import json
 
 import time
 import traceback
-import requests
+#import requests
 import re
 import os
 
@@ -20,9 +20,9 @@ from wizwalker.memory import ObjectType, Window, WindowFlags
 from wizwalker.combat import CombatMember
 from loguru import logger
 
-from src.dance_game_hook import attempt_deactivate_dance_hook
-from src.paths import *
-from src.sprinty_client import SprintyClient
+#from src.dance_game_hook import attempt_deactivate_dance_hook
+from paths import *
+from sprinty_client import SprintyClient
 import typing
 from typing import List, Optional, Coroutine, Union, get_type_hints, Any, Iterable
 from enum import Enum
