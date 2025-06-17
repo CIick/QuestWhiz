@@ -392,12 +392,7 @@ async def WorldsCollideTP(
     if success:
         logger.success("Collision-based teleportation was successful.")
     else:
-        logger.error("Collision-based teleportation failed. Falling back to navmap.")
-        if await try_navmap_then(client, target):
-            logger.success("Navmap fallback was successful.")
-        else:
-            logger.critical("FATAL: Both collision-TP and navmap-TP have failed.")
-
+        logger.error("Collision-based teleportation failed.")
 
 def build_collision_shapes(world: CollisionWorld, z_slice: float, debug: bool = False) -> List[Polygon]:
     shapes = []
@@ -451,25 +446,6 @@ def build_mesh_shapes(world: CollisionWorld, z_slice: float) -> List[Polygon]:
             if len(pts2d) >= 3:
                 shapes.append(Polygon(pts2d).convex_hull)
     return shapes
-
-
-async def try_navmap_then(client: Client, xyz: XYZ, sigma: float = 5.0) -> bool:
-    from src.teleport_math import calc_Distance, navmap_tp
-    start_zone = await client.zone_name()
-    start_pos = await client.body.position()
-
-    logger.info(f"Calling navmap_tp to {xyz}")
-    await navmap_tp(client, xyz)
-    await asyncio.sleep(1)
-
-    curr_pos = await client.body.position()
-    curr_zone = await client.zone_name()
-    moved = calc_Distance(start_pos, curr_pos) > sigma
-    zone_changed = (curr_zone != start_zone)
-    still_free = await is_free(client)
-
-    logger.info(f"Navmap result: moved={moved}, zone_changed={zone_changed}, still_free={still_free}")
-    return (moved or zone_changed or not still_free)
 
 
 async def get_revision_and_zone(client: Client) -> tuple[str, str]:

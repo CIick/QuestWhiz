@@ -28,7 +28,7 @@ class QuestDatabase:
     def __init__(self, db_path: str = "quests.db"):
         """Initializes the database connection and creates tables if they don't exist."""
         # --- FIX: Hardcoding the absolute path as requested for reliability ---
-        hardcoded_path = r"C:\Github Repos Python\Deimos_Developement\src\quests.db"
+        hardcoded_path = r"C:\Github Repos Python\QuestWhiz\quests.db"
         self.db_path = Path(hardcoded_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
