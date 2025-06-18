@@ -36,3 +36,5 @@ __pycache__/
 /claude tips/
 /calculated_collisions/
 /images
+/.claude/settings.local.json
+/questing.py

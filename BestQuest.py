@@ -18,8 +18,104 @@ from wizwalker.memory.memory_objects.madlib_block import MadlibBlock
 from wizwalker.memory.memory_objects.goal_data import GoalData, GoalType
 
 from paths import quest_name_path, advance_dialog_path, popup_title_path, spiral_door_teleport_path, \
-    spiral_door_title_path, npc_range_path, popup_msgtext_path, dungeon_warning_path, spiral_door_exit_path
+    spiral_door_title_path, npc_range_path, popup_msgtext_path, dungeon_warning_path, spiral_door_exit_path, \
+    decline_quest_path, dialog_text_path
 from utils import get_window_from_path, is_visible_by_path, click_window_by_path
+
+
+class PlayerState(Enum):
+    FREE = "free"
+    LOADING = "loading"
+    COMBAT = "combat"
+    DIALOGUE = "dialogue"
+    FORCED_ANIMATION = "forced_animation"
+
+
+class PlayerStateManager:
+    def __init__(self, client: Client):
+        self.client = client
+
+    async def read_dialogue_text(self) -> str:
+        try:
+            dialogue_window = await get_window_from_path(self.client.root_window, dialog_text_path)
+            text = await dialogue_window.maybe_text()
+            return text if text else ""
+        except Exception:
+            return ""
+
+    async def is_in_loading(self) -> bool:
+        return await self.client.is_loading()
+
+    async def is_in_combat(self) -> bool:
+        return await self.client.in_battle()
+
+    async def is_in_dialogue(self) -> bool:
+        return await is_visible_by_path(self.client, advance_dialog_path)
+
+    async def has_dialogue_text(self) -> bool:
+        dialogue_text = await self.read_dialogue_text()
+        return dialogue_text != ""
+
+    async def get_current_state(self) -> PlayerState:
+        if await self.is_in_loading():
+            return PlayerState.LOADING
+        if await self.is_in_combat():
+            return PlayerState.COMBAT
+        if await self.is_in_dialogue():
+            return PlayerState.DIALOGUE
+        if await self.has_dialogue_text():
+            return PlayerState.FORCED_ANIMATION
+        return PlayerState.FREE
+
+    async def is_free(self) -> bool:
+        current_state = await self.get_current_state()
+        return current_state == PlayerState.FREE
+
+    async def wait_for_free_state(self, timeout: float = None):
+        import time
+        start_time = time.time()
+        
+        while not await self.is_free():
+            if timeout and (time.time() - start_time) > timeout:
+                break
+            await asyncio.sleep(0.1)
+
+    async def handle_dialogue_safely(self) -> bool:
+        if not await self.is_in_dialogue():
+            return False
+
+        try:
+            # Check if this is a quest-related dialogue
+            dialogue_text = await self.read_dialogue_text()
+            
+            # If dialogue contains quest-related keywords, we might want to accept
+            quest_keywords = ["quest", "task", "help", "find", "collect", "defeat"]
+            should_accept = any(keyword in dialogue_text.lower() for keyword in quest_keywords)
+            
+            if should_accept:
+                # Accept the quest by clicking the right button (advance_dialog_path)
+                logger.info("Accepting dialogue/quest")
+                while await is_visible_by_path(self.client, advance_dialog_path):
+                    await click_window_by_path(self.client, advance_dialog_path)
+                    await asyncio.sleep(0.5)
+            else:
+                # Decline or exit dialogue by clicking the left button if available
+                if await is_visible_by_path(self.client, decline_quest_path):
+                    logger.info("Declining dialogue/quest")
+                    await click_window_by_path(self.client, decline_quest_path)
+                    await asyncio.sleep(0.5)
+                else:
+                    # Just advance through if no decline option
+                    logger.info("Advancing through dialogue")
+                    while await is_visible_by_path(self.client, advance_dialog_path):
+                        await click_window_by_path(self.client, advance_dialog_path)
+                        await asyncio.sleep(0.5)
+
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error handling dialogue: {e}")
+            return False
 
 
 class Utils:
@@ -101,6 +197,7 @@ class BestQuest:
     def __init__(self, client: Client, clients: list[Client], db_logger: QuestDatabase, all_quest_data=None):
         self.client = client
         self.db_logger = db_logger
+        self.state_manager = PlayerStateManager(client)
         self.goal_handlers = {
             GoalType.unknown: self._handle_unimplemented_goal,
             GoalType.bounty: self._handle_bounty_goal,
@@ -205,17 +302,31 @@ class BestQuest:
     # <editor-fold desc="Action Handlers">
 
     async def _handle_dialogue(self):
+        # Small delay to catch any dialogue that might be appearing
+        await asyncio.sleep(0.2)
+        
+        # Check for sigil entry dialog first
+        if await is_visible_by_path(self.client, npc_range_path):
+            popup_text = await Utils.read_popup_text(self.client)
+            if "to enter" in popup_text.lower():
+                logger.warning("Sigil dialog detected - handling sigil entry...")
+                return await self._handle_sigil_entry()
+        
+        # Handle normal dialogue interactions
         if await is_visible_by_path(self.client, popup_title_path):
             logger.warning("Initial NPC interaction pop-up detected. Pressing 'X' to engage.")
             await self.client.send_key(Keycode.X, 0.1)
             await asyncio.sleep(1.0)
 
-        if await is_visible_by_path(self.client, advance_dialog_path):
-            logger.warning("Main dialogue box detected. Clearing it...")
-            while await is_visible_by_path(self.client, advance_dialog_path):
-                await self.client.send_key(Keycode.X, 0.1)
-                await asyncio.sleep(0.5)
-            logger.success("Dialogue cleared.")
+        # Use the new PlayerStateManager for safe dialogue handling
+        if await self.state_manager.is_in_dialogue():
+            logger.warning("Dialogue detected - handling safely...")
+            handled = await self.state_manager.handle_dialogue_safely()
+            if handled:
+                logger.success("Dialogue handled successfully.")
+                return True
+            
+        return False
 
     async def _handle_sigil_entry(self) -> bool:
         if await is_visible_by_path(self.client, npc_range_path):
@@ -268,8 +379,53 @@ class BestQuest:
         logger.info("Waiting for world travel to complete...")
         while await self.client.is_loading():
             await asyncio.sleep(0.2)
+        
+        # Wait additional time for any post-teleport dialogue to appear
+        await asyncio.sleep(1.5)
         logger.success("World travel complete.")
         return True
+
+    # </editor-fold>
+
+    # <editor-fold desc="Player State Helpers">
+    async def _wait_for_free_state(self, timeout: float = 10.0) -> bool:
+        await self.state_manager.wait_for_free_state(timeout)
+        return await self.state_manager.is_free()
+
+    async def _check_and_handle_player_state(self) -> bool:
+        current_state = await self.state_manager.get_current_state()
+        
+        if current_state == PlayerState.DIALOGUE:
+            logger.info(f"Player in dialogue state - handling...")
+            return await self.state_manager.handle_dialogue_safely()
+        elif current_state == PlayerState.LOADING:
+            logger.info("Player in loading state - waiting...")
+            await self.state_manager.wait_for_free_state(timeout=30.0)
+            return True
+        elif current_state == PlayerState.COMBAT:
+            logger.info("Player in combat state - waiting...")
+            await self.state_manager.wait_for_free_state(timeout=60.0)
+            return True
+        elif current_state == PlayerState.FORCED_ANIMATION:
+            logger.info("Player in forced animation - waiting...")
+            await self.state_manager.wait_for_free_state(timeout=15.0)
+            return True
+        
+        return current_state == PlayerState.FREE
+
+    async def _wait_for_combat_start(self, timeout: float = 10.0) -> bool:
+        import time
+        start_time = time.time()
+        
+        logger.info(f"Waiting for player to enter combat (timeout: {timeout}s)...")
+        while time.time() - start_time < timeout:
+            if await self.state_manager.is_in_combat():
+                logger.success("Player entered combat!")
+                return True
+            await asyncio.sleep(0.1)
+        
+        logger.warning(f"Player did not enter combat within {timeout} seconds.")
+        return False
 
     # </editor-fold>
 
@@ -278,6 +434,25 @@ class BestQuest:
         destination_zone = await goal.goal_destination_zone()
         max_failed_attempts = 5
         failed_attempts = 0
+        # Get the actual goal ID from the quest system for proper tracking
+        quest_manager = await self.client.quest_manager()
+        character_registry = await self.client.character_registry()
+        active_quest_id = await character_registry.active_quest_id()
+        initial_goal_id = None
+        if active_quest_id:
+            all_quests = await quest_manager.quest_data()
+            active_quest = all_quests.get(active_quest_id)
+            if active_quest:
+                all_goals = await active_quest.goal_data()
+                for goal_id, quest_goal in all_goals.items():
+                    if quest_goal == goal:
+                        initial_goal_id = goal_id
+                        break
+        player_radius_offset = 0.5  # Start with default radius
+        
+        # Track if we just switched worlds to avoid unnecessary UI handling
+        initial_world = Utils.get_world_from_zone(await self.client.zone_name())
+        just_switched_worlds = False
 
         while failed_attempts < max_failed_attempts:
             current_zone = await self.client.zone_name()
@@ -286,46 +461,140 @@ class BestQuest:
                 continue
 
             logger.info(
-                f"Travel Loop | Attempt [{failed_attempts + 1}/{max_failed_attempts}] | Destination: '{destination_zone}' | Current: '{current_zone}'")
+                f"Travel Loop | Attempt [{failed_attempts + 1}/{max_failed_attempts}] | Destination: '{destination_zone}' | Current: '{current_zone}' | Radius Offset: {player_radius_offset}")
 
+            # Check if we've reached the destination zone
             if current_zone == destination_zone:
                 logger.success("Player is in the correct zone.")
                 break
 
+            # Check if goal has changed (quest progression) by re-checking active quest
+            if initial_goal_id:
+                current_quest_id = await character_registry.active_quest_id()
+                if current_quest_id != active_quest_id:
+                    logger.info("Active quest has changed during travel, exiting travel loop.")
+                    break
+                
+                # Also check if the current goal is still active by re-matching on-screen text
+                current_on_screen_text = await Utils.get_on_screen_goal_text(self.client)
+                if current_on_screen_text:
+                    current_quests = await quest_manager.quest_data()
+                    current_active_quest = current_quests.get(current_quest_id)
+                    if current_active_quest:
+                        current_goals = await current_active_quest.goal_data()
+                        current_identified_goal_id, current_identified_goal = await self._find_goal_by_text_matching(current_on_screen_text, current_goals)
+                        if current_identified_goal_id and current_identified_goal_id != initial_goal_id:
+                            logger.info(f"Goal has changed from {initial_goal_id} to {current_identified_goal_id}, exiting travel loop.")
+                            break
+
             zone_before_action = current_zone
 
-            # Check for and handle UI elements. If they cause a zone change, the loop will continue and re-evaluate.
-            await self._handle_spiral_door(destination_zone)
-            await self._handle_sigil_entry()
-            await self._handle_dialogue()
+            # Check if we just switched worlds in this loop iteration
+            current_world = Utils.get_world_from_zone(current_zone)
+            if current_world != initial_world:
+                just_switched_worlds = True
+                initial_world = current_world
+                logger.info(f"Detected world switch to '{current_world}'. Skipping initial UI handling to avoid reopening spiral door.")
+            else:
+                just_switched_worlds = False
+            
+            # FIRST: Check player state and handle any blocking conditions
+            if not just_switched_worlds:
+                # Wait for player to be in a free state before proceeding
+                await self._wait_for_free_state(timeout=10.0)
+                
+                # Check and handle current player state
+                state_handled = await self._check_and_handle_player_state()
+                
+                # Handle UI elements
+                dialogue_handled = await self._handle_dialogue()
+                ui_handled = dialogue_handled or await self._handle_spiral_door(destination_zone)
+                if not ui_handled:
+                    ui_handled = await self._handle_sigil_entry()
+                
+                # Check again for dialogue after UI interactions if no sigil was handled
+                if not dialogue_handled:
+                    await self._handle_dialogue()
+            else:
+                # If we just switched worlds, we still need to track ui_handled for logic flow
+                ui_handled = False
+                logger.info("Skipped UI handling due to recent world switch. Proceeding directly to teleportation.")
 
-            if await self.client.zone_name() != zone_before_action:
+            # Check if UI interaction caused a zone change
+            current_zone_after_ui = await self.client.zone_name()
+            if current_zone_after_ui != zone_before_action:
                 logger.success("UI interaction resulted in a zone change. Re-evaluating position.")
+                # Reset radius offset after successful zone change
+                player_radius_offset = 0.5
+                # Update world tracking since we changed zones
+                initial_world = Utils.get_world_from_zone(current_zone_after_ui)
                 continue
 
-            logger.warning("No interactive zoning UI available. Using WorldsCollideTP to move closer...")
-            try:
-                await WorldsCollideTP(self.client)
-                await asyncio.sleep(2.0)
-            except Exception as e:
-                logger.error(f"An error occurred during WorldsCollideTP: {e}", exc_info=True)
-                failed_attempts += 1
-                continue
+            # If no UI was available or handled (or we skipped UI due to world switch), attempt WorldsCollideTP
+            if not ui_handled:
+                logger.warning("No interactive zoning UI available. Using WorldsCollideTP to move closer...")
+                try:
+                    await WorldsCollideTP(self.client, player_radius_offset=player_radius_offset)
+                    await asyncio.sleep(2.0)
+                    
+                    # IMMEDIATELY check for dialogue and UI that might appear after teleportation
+                    await self._handle_dialogue()
+                    
+                    # Check if dialogue handling caused a zone change
+                    zone_after_dialogue = await self.client.zone_name()
+                    if zone_after_dialogue != zone_before_action:
+                        logger.success("Post-teleportation dialogue handling resulted in zone change.")
+                        player_radius_offset = 0.5
+                        # Update world tracking since we changed zones
+                        initial_world = Utils.get_world_from_zone(zone_after_dialogue)
+                        continue
+                    
+                    # Also check for other UI elements that might have appeared
+                    ui_appeared = await self._handle_spiral_door(destination_zone)
+                    if not ui_appeared:
+                        ui_appeared = await self._handle_sigil_entry()
+                    
+                    if ui_appeared:
+                        logger.info("UI elements appeared after teleportation, will re-evaluate in next loop.")
+                        # Update world tracking in case UI caused world change
+                        post_ui_zone = await self.client.zone_name()
+                        initial_world = Utils.get_world_from_zone(post_ui_zone)
+                        continue
+                    
+                except Exception as e:
+                    logger.error(f"An error occurred during WorldsCollideTP: {e}", exc_info=True)
+                    failed_attempts += 1
+                    # Increase radius offset to push away from collision issues
+                    player_radius_offset = min(player_radius_offset + 0.2, 1.5)
+                    continue
 
-            if await self.client.zone_name() == zone_before_action:
-                logger.error("No progress made in this travel attempt.")
-                failed_attempts += 1
+                # Check if WorldsCollideTP made progress (only after handling all UI)
+                zone_after_tp = await self.client.zone_name()
+                if zone_after_tp == zone_before_action:
+                    logger.error("No progress made in this travel attempt.")
+                    failed_attempts += 1
+                    # Increase radius offset to avoid getting stuck in same location
+                    player_radius_offset = min(player_radius_offset + 0.2, 1.5)
+                else:
+                    # Reset radius offset after successful movement
+                    player_radius_offset = 0.5
+                    # Update world tracking in case we moved to a new world
+                    initial_world = Utils.get_world_from_zone(zone_after_tp)
         else:
             logger.error(
                 f"Failed to reach destination zone '{destination_zone}' after {max_failed_attempts} failed attempts.")
             return
 
         logger.info("Performing final teleport to precise waypoint location...")
-        await WorldsCollideTP(self.client)
-        # Final UI check after arriving at the exact spot
-        await self._handle_dialogue()
-        await self._handle_sigil_entry()  # Check for sigils at final location too
-        logger.success("Arrived at final quest location.")
+        try:
+            await WorldsCollideTP(self.client, player_radius_offset=player_radius_offset)
+            await asyncio.sleep(1.0)
+            # Final UI check after arriving at the exact spot
+            await self._handle_dialogue()
+            await self._handle_sigil_entry()  # Check for sigils at final location too
+            logger.success("Arrived at final quest location.")
+        except Exception as e:
+            logger.error(f"Final teleportation failed: {e}", exc_info=True)
 
     # </editor-fold>
 
@@ -335,51 +604,69 @@ class BestQuest:
         await self._travel_to_goal_location(goal)
 
     async def _handle_persona_goal(self, goal: GoalData):
-        logger.info("Handling PERSONA goal...")
+        logger.info("Handling PERSONA goal.")
         await self._travel_to_goal_location(goal)
         await self._handle_dialogue()
 
     async def _handle_usage_goal(self, goal: GoalData):
-        logger.info("Handling USAGE goal. Not implemented yet.")
+        logger.info("Handling USAGE goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_bounty_goal(self, goal: GoalData):
-        logger.info("Handling BOUNTY goal. Not implemented yet.")
+        logger.info("Handling BOUNTY goal.")
+        await self._travel_to_goal_location(goal)
+        logger.info("This is a Defeat quest. Waiting for player to enter combat...")
+        await self._wait_for_combat_start()
 
     async def _handle_bountycollect_goal(self, goal: GoalData):
-        logger.info("Handling BOUNTYCOLLECT goal. Not implemented yet.")
+        logger.info("Handling BOUNTYCOLLECT goal.")
+        await self._travel_to_goal_location(goal)
+        logger.info("This is a Defeat and Collect quest. Waiting for player to enter combat...")
+        await self._wait_for_combat_start()
 
     async def _handle_scavenge_goal(self, goal: GoalData):
-        logger.info("Handling SCAVENGE goal. Not implemented yet.")
+        logger.info("Handling SCAVENGE goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_scavengefake_goal(self, goal: GoalData):
-        logger.info("Handling SCAVENGEFAKE goal. Not implemented yet.")
+        logger.info("Handling SCAVENGEFAKE goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_achieverank_goal(self, goal: GoalData):
-        logger.info("Handling ACHIEVERANK goal. Not implemented yet.")
+        logger.info("Handling ACHIEVERANK goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_completequest_goal(self, goal: GoalData):
-        logger.info("Handling COMPLETEQUEST goal. Not implemented yet.")
+        logger.info("Handling COMPLETEQUEST goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_sociarank_goal(self, goal: GoalData):
-        logger.info("Handling SOCIARANK goal. Not implemented yet.")
+        logger.info("Handling SOCIARANK goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_sociacurrency_goal(self, goal: GoalData):
-        logger.info("Handling SOCIACURRENCY goal. Not implemented yet.")
+        logger.info("Handling SOCIACURRENCY goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_sociaminigame_goal(self, goal: GoalData):
-        logger.info("Handling SOCIAMINIGAME goal. Not implemented yet.")
+        logger.info("Handling SOCIAMINIGAME goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_sociagiveitem_goal(self, goal: GoalData):
-        logger.info("Handling SOCIAGIVEITEM goal. Not implemented yet.")
+        logger.info("Handling SOCIAGIVEITEM goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_sociagetitem_goal(self, goal: GoalData):
-        logger.info("Handling SOCIAGETITEM goal. Not implemented yet.")
+        logger.info("Handling SOCIAGETITEM goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_collectafterbounty_goal(self, goal: GoalData):
-        logger.info("Handling COLLECTAFTERBOUNTY goal. Not implemented yet.")
+        logger.info("Handling COLLECTAFTERBOUNTY goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_encounter_waypoint_foreach_goal(self, goal: GoalData):
-        logger.info("Handling ENCOUNTER_WAYPOINT_FOREACH goal. Not implemented yet.")
+        logger.info("Handling ENCOUNTER_WAYPOINT_FOREACH goal.")
+        await self._travel_to_goal_location(goal)
 
     async def _handle_unimplemented_goal(self, goal: GoalData):
         goal_type = await goal.goal_type()
@@ -440,6 +727,17 @@ class BestQuest:
     # </editor-fold>
 
     async def run(self):
+        # Handle any dialogue that might be on screen from previous quest completion
+        logger.debug("Checking for dialogue at start of quest processing cycle...")
+        await self._handle_dialogue()
+        
+        # Wait for player to be in a free state before quest detection
+        logger.debug("Waiting for free state before quest detection...")
+        await self._wait_for_free_state(timeout=10.0)
+        
+        # Handle any remaining player state issues
+        await self._check_and_handle_player_state()
+        
         quest_manager = await self.client.quest_manager()
         character_registry = await self.client.character_registry()
 
@@ -461,12 +759,26 @@ class BestQuest:
 
         # Initial check for blocking UI before starting the main logic
         zone_before_action = await self.client.zone_name()
-        await self._handle_spiral_door(await identified_goal.goal_destination_zone() if identified_goal else "")
-        await self._handle_sigil_entry()
-        await self._handle_dialogue()
-        if await self.client.zone_name() != zone_before_action:
-            logger.info("UI handled at start of loop, restarting run.")
-            return
+        
+        # Wait for player to be free before starting quest logic
+        await self._wait_for_free_state(timeout=15.0)
+        
+        # Check and handle any blocking states
+        await self._check_and_handle_player_state()
+        
+        if identified_goal:
+            ui_handled = await self._handle_spiral_door(await identified_goal.goal_destination_zone())
+            if not ui_handled:
+                ui_handled = await self._handle_sigil_entry()
+            # Always check for dialogue after any teleportation or UI interaction
+            await self._handle_dialogue()
+            
+            if await self.client.zone_name() != zone_before_action:
+                logger.info("UI handled at start of loop, restarting run.")
+                return
+        else:
+            # Still handle dialogue even if no goal identified
+            await self._handle_dialogue()
 
         if not identified_goal:
             logger.error("Could not identify an active goal from on-screen text.")
@@ -488,11 +800,18 @@ class BestQuest:
         handler_method = self.goal_handlers.get(goal_type, self._handle_unimplemented_goal)
 
         logger.info(f"Processing active goal of type '{goal_type.name}'...")
+        input("Quest Auditor -> Press Enter to after looking at the type of goal.")
+
         await handler_method(active_goal)
 
         # Final check after a handler has run
-        await self._handle_spiral_door(await identified_goal.goal_destination_zone())
-        await self._handle_sigil_entry()
+        if identified_goal:
+            ui_handled = await self._handle_spiral_door(await identified_goal.goal_destination_zone())
+            if not ui_handled:
+                ui_handled = await self._handle_sigil_entry()
+        
+        # Final state check and dialogue handling
+        await self._check_and_handle_player_state()
         await self._handle_dialogue()
 
 
@@ -509,11 +828,13 @@ async def main():
         db_logger = QuestDatabase()
         best_quest = BestQuest(client, [], db_logger)
 
-        logger.info("Script running. Press SPACE to process the current quest, or '1' to exit.")
+        logger.info("Script running. Press NINE to process the current quest, or END to exit.")
         while True:
-            if keyboard.is_pressed('space'):
+            if keyboard.is_pressed('9'):
                 await best_quest.run()
-            if keyboard.is_pressed('1'):
+                logger.info("Quest processing complete. Restarting quest processing loop...")
+                await asyncio.sleep(2.0)  # Brief pause before reprocessing
+            if keyboard.is_pressed('end'):
                 logger.info("Exit key pressed. Shutting down.")
                 break
 
