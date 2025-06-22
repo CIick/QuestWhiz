@@ -3,10 +3,15 @@ import inspect
 import math
 import os
 import shutil
+import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Coroutine, Sequence, Union, List
-
+from katsuba.op import *
+from katsuba.wad import Archive
+from katsuba.utils import string_id
+import json
 # Added import for keyboard listening
 import keyboard
 from loguru import logger
@@ -20,7 +25,7 @@ from shapely.ops import unary_union, nearest_points
 from utils import is_free
 
 # DEV flag to control destructive actions like deleting directories
-DEV_MODE = True
+DEV_MODE = False
 
 # Use 'Agg' backend for saving plots to file without GUI issues
 matplotlib.use("Agg")
@@ -28,11 +33,549 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPoly
 
 from wizwalker import Client, ClientHandler, XYZ
-from collision import get_collision_data, CollisionWorld, ProxyType
+from collision import get_collision_data, CollisionWorld, ProxyType, get_nif_from_wad, find_nif_wad_candidates, get_entity_collision_shape, get_cache_directory, load_cached_wcp_collision, save_wcp_collision_cache
 from collision_math import toCubeVertices, transformCube
 
 
+# Global tracking for dynamic collision zones discovered through rubber-band failures
+_dynamic_collision_zones = []  # List of {"position": XYZ, "radius": float, "zone_name": str}
+
+
+# <editor-fold desc="Dynamic Collision Zone Management">
+
+async def _add_or_expand_dynamic_collision_zone(failed_position: XYZ, zone_name: str, player_radius: float, client: Client):
+    """
+    Add a new dynamic collision zone or expand an existing one at the failed teleport location.
+    
+    Args:
+        failed_position: Where the teleport was attempted but rubber-banded
+        zone_name: Current zone name for tracking
+        player_radius: Current player radius for expansion calculations
+        client: Game client for saving to cache
+    """
+    global _dynamic_collision_zones
+    
+    # Check if we already have a collision zone near this position (within 100 units)
+    existing_zone = None
+    for zone in _dynamic_collision_zones:
+        if zone["zone_name"] == zone_name:
+            distance = ((zone["position"].x - failed_position.x) ** 2 + 
+                       (zone["position"].y - failed_position.y) ** 2) ** 0.5
+            if distance < 100:  # Consider zones within 100 units as the same failure area
+                existing_zone = zone
+                break
+    
+    if existing_zone:
+        # Expand existing zone by player radius
+        existing_zone["radius"] += player_radius
+        logger.warning(f"Expanded dynamic collision zone at {existing_zone['position']} to radius {existing_zone['radius']:.1f}")
+    else:
+        # Create new collision zone starting with base radius
+        initial_radius = 50.0  # Base size for newly discovered collision
+        new_zone = {
+            "position": failed_position,
+            "radius": initial_radius,
+            "zone_name": zone_name
+        }
+        _dynamic_collision_zones.append(new_zone)
+        logger.warning(f"Added new dynamic collision zone at {failed_position} with radius {initial_radius}")
+    
+    # Save updated dynamic collision zones to file
+    await _save_dynamic_collision_zones(client, zone_name)
+
+
+def _get_dynamic_collision_polygons(zone_name: str) -> List[Polygon]:
+    """
+    Get collision polygons for all dynamic collision zones in the current zone.
+    
+    Args:
+        zone_name: Current zone name
+        
+    Returns:
+        List of Polygon objects representing dynamic collision zones
+    """
+    polygons = []
+    for zone in _dynamic_collision_zones:
+        if zone["zone_name"] == zone_name:
+            # Create circular collision polygon at the failed position
+            collision_circle = Point(zone["position"].x, zone["position"].y).buffer(zone["radius"])
+            polygons.append(collision_circle)
+    
+    if polygons:
+        logger.info(f"Including {len(polygons)} dynamic collision zones in collision calculation")
+    
+    return polygons
+
+
+def _clear_dynamic_collision_zones(zone_name: str = None):
+    """
+    Clear dynamic collision zones, optionally only for a specific zone.
+    
+    Args:
+        zone_name: If provided, only clear zones for this zone. If None, clear all.
+    """
+    global _dynamic_collision_zones
+    
+    if zone_name:
+        initial_count = len(_dynamic_collision_zones)
+        _dynamic_collision_zones = [zone for zone in _dynamic_collision_zones if zone["zone_name"] != zone_name]
+        cleared_count = initial_count - len(_dynamic_collision_zones)
+        if cleared_count > 0:
+            logger.info(f"Cleared {cleared_count} dynamic collision zones for zone {zone_name}")
+    else:
+        cleared_count = len(_dynamic_collision_zones)
+        _dynamic_collision_zones = []
+        if cleared_count > 0:
+            logger.info(f"Cleared all {cleared_count} dynamic collision zones")
+
+
+async def _save_dynamic_collision_zones(client: Client, zone_name: str):
+    """
+    Save dynamic collision zones for a zone to a WCP file for persistence across sessions.
+    
+    Args:
+        client: Game client for cache directory access
+        zone_name: Zone name to save dynamic collision for
+    """
+    try:
+        from collision import get_cache_directory
+        
+        cache_dir = await get_cache_directory(client)
+        sane_zone_name = "".join(c for c in zone_name if c.isalnum() or c in (' ', '_')).rstrip().replace(" ", "_")
+        manual_collision_file = cache_dir / f"{sane_zone_name}_manual_collision.wcp"
+        
+        # Load existing data first if file exists
+        existing_data = []
+        if manual_collision_file.exists():
+            try:
+                with open(manual_collision_file, 'r') as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning(f"Could not load existing dynamic collision data from {manual_collision_file}, starting fresh")
+                existing_data = []
+        
+        # Get current dynamic collision zones for this zone
+        current_zone_data = []
+        for zone in _dynamic_collision_zones:
+            if zone["zone_name"] == zone_name:
+                current_zone_data.append({
+                    "x": zone["position"].x,
+                    "y": zone["position"].y, 
+                    "z": zone["position"].z,
+                    "radius": zone["radius"]
+                })
+        
+        # Merge existing and current data, avoiding duplicates
+        merged_data = existing_data.copy()
+        for new_zone in current_zone_data:
+            # Check if this zone position already exists in saved data
+            duplicate_found = False
+            for existing_zone in merged_data:
+                distance = ((existing_zone["x"] - new_zone["x"]) ** 2 + 
+                           (existing_zone["y"] - new_zone["y"]) ** 2) ** 0.5
+                if distance < 50:  # Same threshold used for detection
+                    # Update radius if the new one is larger
+                    if new_zone["radius"] > existing_zone["radius"]:
+                        existing_zone["radius"] = new_zone["radius"]
+                    duplicate_found = True
+                    break
+            
+            if not duplicate_found:
+                merged_data.append(new_zone)
+        
+        if merged_data:
+            with open(manual_collision_file, 'w') as f:
+                json.dump(merged_data, f, indent=2)
+            logger.info(f"Saved {len(merged_data)} dynamic collision zones to {manual_collision_file}")
+        else:
+            # Remove file if no zones to save
+            if manual_collision_file.exists():
+                manual_collision_file.unlink()
+                logger.info(f"Removed empty dynamic collision file: {manual_collision_file}")
+                
+    except Exception as e:
+        logger.error(f"Failed to save dynamic collision zones: {e}")
+
+
+async def _load_dynamic_collision_zones(client: Client, zone_name: str):
+    """
+    Load previously saved dynamic collision zones for a zone from WCP file.
+    
+    Args:
+        client: Game client for cache directory access
+        zone_name: Zone name to load dynamic collision for
+    """
+    global _dynamic_collision_zones
+    
+    try:
+        from collision import get_cache_directory
+        
+        cache_dir = await get_cache_directory(client)
+        sane_zone_name = "".join(c for c in zone_name if c.isalnum() or c in (' ', '_')).rstrip().replace(" ", "_")
+        manual_collision_file = cache_dir / f"{sane_zone_name}_manual_collision.wcp"
+        
+        if not manual_collision_file.exists():
+            return  # No saved dynamic collision data
+        
+        with open(manual_collision_file, 'r') as f:
+            zone_data = json.load(f)
+        
+        # Load zones into memory, but only if they're not already present
+        loaded_count = 0
+        for zone_info in zone_data:
+            position = XYZ(zone_info["x"], zone_info["y"], zone_info["z"])
+            
+            # Check if we already have a similar zone (avoid duplicates)
+            exists = False
+            for existing_zone in _dynamic_collision_zones:
+                if (existing_zone["zone_name"] == zone_name and 
+                    abs(existing_zone["position"].x - position.x) < 50 and
+                    abs(existing_zone["position"].y - position.y) < 50):
+                    exists = True
+                    break
+            
+            if not exists:
+                _dynamic_collision_zones.append({
+                    "position": position,
+                    "radius": zone_info["radius"],
+                    "zone_name": zone_name
+                })
+                loaded_count += 1
+        
+        if loaded_count > 0:
+            logger.info(f"Loaded {loaded_count} dynamic collision zones from {manual_collision_file}")
+            
+    except Exception as e:
+        logger.error(f"Failed to load dynamic collision zones: {e}")
+
+
 # <editor-fold desc="Refactored Helper Functions">
+
+def filter_valid_polygons(shapes: List[Any]) -> List[Polygon]:
+    """Filter out non-polygon geometries (like LineString) to prevent .exterior crashes."""
+    valid_polygons = []
+    for shape in shapes:
+        if hasattr(shape, 'geom_type'):
+            if shape.geom_type == 'Polygon':
+                valid_polygons.append(shape)
+            elif shape.geom_type == 'MultiPolygon':
+                # Extract individual polygons from MultiPolygon
+                for poly in shape.geoms:
+                    if poly.geom_type == 'Polygon':
+                        valid_polygons.append(poly)
+                logger.debug(f"Expanded MultiPolygon into {len(shape.geoms)} individual polygons")
+            else:
+                logger.warning(f"Filtering out non-polygon geometry: {shape.geom_type}")
+        else:
+            logger.warning(f"Filtering out unknown geometry type: {type(shape)}")
+    return valid_polygons
+
+
+def generate_collision_plots(static_shapes: List[Polygon], entity_shapes: List[Polygon], 
+                           player_pos: XYZ, target_pos: XYZ, expected_tp_pos: XYZ, 
+                           zone_name: str, debug: bool = True) -> None:
+    """
+    Generate 3 collision visualization plots:
+    1. Combined collision map (static + entities)
+    2. Static collision only 
+    3. Entity collision only
+    """
+    if not debug:
+        logger.debug("Debug mode disabled, skipping collision plot generation")
+        return
+    
+    try:
+        # Create images directory
+        images_dir = Path("images")
+        images_dir.mkdir(exist_ok=True)
+        
+        # Generate safe zone name for filename
+        safe_zone_name = "".join(c for c in zone_name if c.isalnum() or c in (' ', '_')).rstrip().replace(" ", "_")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+        # Filter out any invalid geometries
+        static_shapes = filter_valid_polygons(static_shapes)
+        entity_shapes = filter_valid_polygons(entity_shapes)
+        
+        if not static_shapes and not entity_shapes:
+            logger.warning("No valid collision shapes to plot")
+            return
+        
+        # Calculate bounds for all plots
+        all_shapes = static_shapes + entity_shapes
+        if all_shapes:
+            all_bounds = [shape.bounds for shape in all_shapes]
+            min_x = min(bounds[0] for bounds in all_bounds)
+            min_y = min(bounds[1] for bounds in all_bounds) 
+            max_x = max(bounds[2] for bounds in all_bounds)
+            max_y = max(bounds[3] for bounds in all_bounds)
+            
+            # Expand bounds to include key positions
+            positions_x = [player_pos.x, target_pos.x, expected_tp_pos.x]
+            positions_y = [player_pos.y, target_pos.y, expected_tp_pos.y]
+            
+            min_x = min(min_x, min(positions_x) - 100)
+            max_x = max(max_x, max(positions_x) + 100)
+            min_y = min(min_y, min(positions_y) - 100)
+            max_y = max(max_y, max(positions_y) + 100)
+        else:
+            # Fallback bounds based on positions only
+            positions_x = [player_pos.x, target_pos.x, expected_tp_pos.x]
+            positions_y = [player_pos.y, target_pos.y, expected_tp_pos.y]
+            min_x, max_x = min(positions_x) - 500, max(positions_x) + 500
+            min_y, max_y = min(positions_y) - 500, max(positions_y) + 500
+        
+        # Common plot setup function
+        def setup_plot(ax, title: str):
+            ax.set_xlim(min_x, max_x)
+            ax.set_ylim(min_y, max_y)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{title}\n{zone_name}", fontsize=12)
+            ax.set_xlabel("X Coordinate")
+            ax.set_ylabel("Y Coordinate")
+            
+            # Add position markers
+            # ax.plot(player_pos.x, player_pos.y, marker='*', color='green', markersize=15,
+            #        label='Player Start', zorder=10)
+            # ax.plot(target_pos.x, target_pos.y, marker='X', color='red', markersize=12,
+            #        label='Quest Target', zorder=10)
+            ax.plot(expected_tp_pos.x, expected_tp_pos.y, marker='o', color='blue', markersize=10, 
+                   label='Expected TP', zorder=10)
+            ax.legend(loc='upper right')
+        
+        # 1. Combined collision map
+        fig, ax = plt.subplots(figsize=(12, 10))
+        setup_plot(ax, "Combined Collision Map")
+        
+        # Plot static collision (blue)
+        for shape in static_shapes:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                ax.plot(x, y, color='blue', linewidth=1, alpha=0.7)
+                ax.fill(x, y, color='blue', alpha=0.3)
+        
+        # Plot entity collision (red, with different styles for multi-polygon entities)
+        multi_polygon_count = 0
+        for shape in entity_shapes:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                # Use slightly different colors to distinguish multi-polygon components
+                color = 'red' if multi_polygon_count == 0 else 'darkred'
+                alpha = 0.7 - (multi_polygon_count * 0.1)  # Vary transparency slightly
+                ax.plot(x, y, color=color, linewidth=1, alpha=max(alpha, 0.3))
+                ax.fill(x, y, color=color, alpha=max(0.3 - (multi_polygon_count * 0.05), 0.1))
+                multi_polygon_count += 1
+        
+        # Add color legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='blue', alpha=0.7, linewidth=3, label='Static Collision'),
+            Line2D([0], [0], color='red', alpha=0.7, linewidth=3, label='Entity Collision (NIF-based)'),
+            Line2D([0], [0], color='darkred', alpha=0.6, linewidth=2, label='Multi-part Entity Components')
+        ]
+        ax.legend(handles=legend_elements, loc='upper left')
+        
+        combined_file = images_dir / f"{safe_zone_name}_{timestamp}_combined_collision_map.png"
+        plt.tight_layout()
+        plt.savefig(combined_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.success(f"Saved combined collision map: {combined_file}")
+        
+        # 2. Static collision only
+        fig, ax = plt.subplots(figsize=(12, 10))
+        setup_plot(ax, "Static Collision Map")
+        
+        for shape in static_shapes:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                ax.plot(x, y, color='blue', linewidth=1, alpha=0.8)
+                ax.fill(x, y, color='blue', alpha=0.4)
+        
+        static_file = images_dir / f"{safe_zone_name}_{timestamp}_static_collision_map.png"
+        plt.tight_layout()
+        plt.savefig(static_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.success(f"Saved static collision map: {static_file}")
+        
+        # 3. Entity collision only
+        fig, ax = plt.subplots(figsize=(12, 10))
+        setup_plot(ax, "Entity Collision Map")
+        
+        # Enhanced visualization for entity collision plots
+        multi_polygon_count = 0
+        for shape in entity_shapes:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                # Use different colors for multi-polygon components
+                color = 'red' if multi_polygon_count == 0 else 'darkred'
+                alpha = 0.8 - (multi_polygon_count * 0.1)
+                ax.plot(x, y, color=color, linewidth=1, alpha=max(alpha, 0.4))
+                ax.fill(x, y, color=color, alpha=max(0.4 - (multi_polygon_count * 0.05), 0.2))
+                multi_polygon_count += 1
+        
+        entity_file = images_dir / f"{safe_zone_name}_{timestamp}_entity_collision_map.png"
+        plt.tight_layout()
+        plt.savefig(entity_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.success(f"Saved entity collision map: {entity_file}")
+        
+        # 4. Player area detail collision map
+        _collision_around_player(
+            static_shapes=static_shapes,
+            entity_shapes=entity_shapes, 
+            player_pos=player_pos,
+            zone_name=zone_name,
+            target_pos=target_pos,
+            show_target=True,
+            show_quest=True,
+            debug=debug
+        )
+        
+        logger.info(f"Generated collision plots for {len(static_shapes)} static and {len(entity_shapes)} entity shapes")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate collision plots: {e}")
+
+
+def _collision_around_player(static_shapes: List[Polygon], entity_shapes: List[Polygon], 
+                           player_pos: XYZ, zone_name: str, 
+                           zoom_radius: float = 5000.0,
+                           target_pos: XYZ = None, 
+                           show_target: bool = True, 
+                           show_quest: bool = True,
+                           debug: bool = True) -> None:
+    """
+    Generate a detailed collision plot centered around the player position.
+    Shows collision shapes within a specified radius for detailed analysis.
+    
+    Args:
+        static_shapes: List of static collision polygons
+        entity_shapes: List of entity collision polygons  
+        player_pos: Player position (center of plot)
+        zone_name: Zone name for filename
+        zoom_radius: Radius around player to include (default 5000 units)
+        target_pos: Optional quest target position
+        show_target: Whether to show target marker
+        show_quest: Whether to show quest-related markers
+        debug: Whether to generate the plot (debug mode check)
+    """
+    if not debug:
+        logger.debug("Debug mode disabled, skipping player area collision plot")
+        return
+    
+    try:
+        # Create images directory
+        images_dir = Path("images")
+        images_dir.mkdir(exist_ok=True)
+        
+        # Generate safe zone name for filename
+        safe_zone_name = "".join(c for c in zone_name if c.isalnum() or c in (' ', '_')).rstrip().replace(" ", "_")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+        # Calculate bounds centered on player
+        center_x, center_y = player_pos.x, player_pos.y
+        min_x = center_x - zoom_radius
+        max_x = center_x + zoom_radius
+        min_y = center_y - zoom_radius
+        max_y = center_y + zoom_radius
+        
+        # Filter shapes to only include those within or intersecting the zoom area
+        from shapely.geometry import box
+        zoom_box = box(min_x, min_y, max_x, max_y)
+        
+        # Filter collision shapes to zoom area
+        visible_static = []
+        visible_entity = []
+        
+        for shape in static_shapes:
+            if hasattr(shape, 'intersects') and zoom_box.intersects(shape):
+                visible_static.append(shape)
+        
+        for shape in entity_shapes:
+            if hasattr(shape, 'intersects') and zoom_box.intersects(shape):
+                visible_entity.append(shape)
+        
+        logger.debug(f"Player area plot: {len(visible_static)} static, {len(visible_entity)} entity shapes in {zoom_radius}-unit radius around player at ({player_pos.x:.1f}, {player_pos.y:.1f})")
+        
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        # Set bounds and styling
+        ax.set_xlim(min_x, max_x)
+        ax.set_ylim(min_y, max_y)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Player Area Collision Detail\n{zone_name} (Radius: {zoom_radius:.0f} units)", fontsize=14, fontweight='bold')
+        ax.set_xlabel("X Coordinate")
+        ax.set_ylabel("Y Coordinate")
+        
+        # Plot static collision shapes (blue)
+        for shape in visible_static:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                ax.plot(x, y, color='blue', linewidth=1.5, alpha=0.8)
+                ax.fill(x, y, color='blue', alpha=0.3)
+        
+        # Plot entity collision shapes (red with multi-polygon support)
+        multi_polygon_count = 0
+        for shape in visible_entity:
+            if hasattr(shape, 'exterior'):
+                x, y = shape.exterior.xy
+                # Use different shades for multi-polygon components
+                color = 'red' if multi_polygon_count == 0 else 'darkred'
+                alpha = 0.8 - (multi_polygon_count * 0.1)
+                ax.plot(x, y, color=color, linewidth=1.5, alpha=max(alpha, 0.4))
+                ax.fill(x, y, color=color, alpha=max(0.4 - (multi_polygon_count * 0.05), 0.15))
+                multi_polygon_count += 1
+        
+        # Plot player position (distinctive green marker)
+        ax.plot(player_pos.x, player_pos.y, marker='*', color='lime', markersize=20, 
+               markeredgecolor='darkgreen', markeredgewidth=2, label='Player Position', zorder=10)
+        
+        # Optionally plot target position
+        if show_target and target_pos:
+            ax.plot(target_pos.x, target_pos.y, marker='X', color='orange', markersize=15,
+                   markeredgecolor='darkorange', markeredgewidth=2, label='Quest Target', zorder=9)
+        
+        # Create legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='*', color='lime', markersize=15, markeredgecolor='darkgreen', 
+                   linestyle='None', label='Player Position'),
+            Line2D([0], [0], color='blue', alpha=0.7, linewidth=3, label='Static Collision'),
+            Line2D([0], [0], color='red', alpha=0.7, linewidth=3, label='Entity Collision (NIF-based)')
+        ]
+        
+        if show_target and target_pos:
+            legend_elements.append(
+                Line2D([0], [0], marker='X', color='orange', markersize=12, markeredgecolor='darkorange',
+                       linestyle='None', label='Quest Target')
+            )
+        
+        if visible_entity and multi_polygon_count > 1:
+            legend_elements.append(
+                Line2D([0], [0], color='darkred', alpha=0.6, linewidth=2, label='Multi-part Entity Components')
+            )
+        
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        # Add zoom radius indicator
+        circle = plt.Circle((player_pos.x, player_pos.y), zoom_radius, fill=False, 
+                           color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        ax.add_patch(circle)
+        
+        # Save the plot
+        player_area_file = images_dir / f"{safe_zone_name}_{timestamp}_player_area_collision.png"
+        plt.tight_layout()
+        plt.savefig(player_area_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.success(f"Saved player area collision plot: {player_area_file}")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate player area collision plot: {e}")
+
 
 async def _setup_export_paths(client: Client) -> tuple[Path, str]:
     """Sets up the directories and filenames for exporting collision data."""
@@ -63,6 +606,29 @@ async def _setup_export_paths(client: Client) -> tuple[Path, str]:
 async def _load_and_build_collision_geometry(client: Client, z_slice: float, debug: bool = False) -> tuple[
     CollisionWorld, List[Polygon], List[Polygon]]:
     """Loads raw collision data and builds 2D polygon shapes for static geometry."""
+    
+    # Try to load cached collision data first
+    try:
+        cache_dir = await get_cache_directory(client)
+        zone_name = await client.zone_name()
+        cached_polygons = load_cached_wcp_collision(cache_dir, zone_name)
+        
+        if cached_polygons:
+            logger.info(f"Using cached collision data with {len(cached_polygons)} polygons")
+            # Still need to load raw data for mesh shapes and world object info
+            raw = await get_collision_data(client)
+            world = CollisionWorld()
+            world.load(raw)
+            mesh_shapes = build_mesh_shapes(world, z_slice)
+            return world, cached_polygons, mesh_shapes
+        else:
+            logger.info("No cached collision data found, generating from raw data...")
+            
+    except Exception as e:
+        logger.warning(f"Failed to load cached collision data: {e}")
+        logger.info("Falling back to raw collision data generation...")
+    
+    # Load and process raw collision data
     raw = await get_collision_data(client)
     world = CollisionWorld()
     world.load(raw)
@@ -75,50 +641,289 @@ async def _load_and_build_collision_geometry(client: Client, z_slice: float, deb
 
     coll_shapes = build_collision_shapes(world, z_slice, debug=debug)
     mesh_shapes = build_mesh_shapes(world, z_slice)
+    
+    # Save the generated collision data to cache
+    try:
+        cache_dir = await get_cache_directory(client)
+        zone_name = await client.zone_name()
+        save_wcp_collision_cache(cache_dir, zone_name, coll_shapes)
+    except Exception as e:
+        logger.warning(f"Failed to save collision data to cache: {e}")
+    
     return world, coll_shapes, mesh_shapes
 
 
-async def _get_entity_collision_shapes(client: Client, static_body_radius: float) -> List[Polygon]:
+def _op_to_dict(type_list, v):
+    """Convert LazyObjects and LazyLists to regular Python objects for JSON serialization"""
+    if isinstance(v, LazyObject):
+        result = {}
+
+        # Add the type hash as $__type (this is the key part!)
+        if hasattr(v, 'type_hash'):
+            result["$__type"] = v.type_hash
+
+        # Add all the object's properties
+        for k, e in v.items(type_list):
+            result[k] = _op_to_dict(type_list, e)
+
+        return result
+    elif isinstance(v, LazyList):
+        return [_op_to_dict(type_list, e) for e in v]
+    elif isinstance(v, bytes):
+        try:
+            return v.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                return v.decode('latin-1')
+            except UnicodeDecodeError:
+                import base64
+                return {"__bytes__": base64.b64encode(v).decode('ascii')}
+    elif hasattr(v, '__class__') and v.__class__.__name__ == 'Color':
+        return {
+            "__type__": "Color",
+            "value": str(v)
+        }
+    return v
+
+
+async def _debug_write_entity_json(entity_name: str, serializable_data: dict) -> None:
+    """Debug function to write entity data to JSON files"""
+    entities_dir = Path.cwd() / "entities"
+    entities_dir.mkdir(exist_ok=True)
+
+    json_file = entities_dir / f"{entity_name}.json"
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(serializable_data, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"[DEV_MODE] Saved deserialized data for {entity_name} to {json_file}")
+
+
+async def _log_asset_to_file(entity_name: str, asset_name: str, zone_name: str) -> None:
+    """Log asset names to a text file for pattern analysis"""
+    asset_logs_dir = Path.cwd() / "asset logs"
+    asset_logs_dir.mkdir(exist_ok=True)
+
+    asset_log_file = asset_logs_dir / "scanned_assets.txt"
+
+    # Append to the file as CSV
+    with open(asset_log_file, 'a', encoding='utf-8') as f:
+        f.write(f"{entity_name},{asset_name},{zone_name}\n")
+
+
+async def _setup_katsuba_search(client: Client, entity_names: list[str]) -> dict[str, dict]:
     """
-    Gets entities and approximates their collision shapes as circles.
-    Uses a dynamic radius for 'CharacterBody' and a static default radius for ALL other types.
+    Sets up katsuba search and finds file paths for all given entity names.
+    Returns a dictionary mapping entity_name -> {"file_path": str, "data": dict}
+    """
+    logger.info("Setting up katsuba search")
+
+    revision, zone_name = await get_revision_and_zone(client)
+    logger.info(f"Katsuba search for {zone_name} zone... searching for {len(entity_names)} entities")
+
+    # Extract root zone from zone_name for WorldData.wad lookup
+    root_zone = zone_name.split('/')[0]
+    world_data_path = fr"C:\ProgramData\KingsIsle Entertainment\Wizard101\Data\GameData\{root_zone}-WorldData.wad"
+    logger.info(f"Root zone extracted: {root_zone}")
+    logger.info(f"Looking for WorldData file at: {world_data_path}")
+
+    type_list = TypeList.open(Path.cwd() / "types" / f"{revision}.json")
+    opts = SerializerOptions()
+    opts.flags |= STATEFUL_FLAGS
+    opts.shallow = False
+    opts.skip_unknown_types = True
+    ser = Serializer(opts, type_list)
+    logger.info(f"Katsuba SerializerOptions configured -> Flags: {opts.flags} -> Shallow: {opts.shallow}")
+    logger.warning("Archive (Root.wad) path is hard coded, remember to change in production code for people with steam")
+    archive = Archive.mmap(r"C:\ProgramData\KingsIsle Entertainment\Wizard101\Data\GameData\Root.wad")
+
+    # Create a set for faster lookups
+    entity_names_set = set(f"{name}.xml" for name in entity_names)
+    entity_data_map = {}
+
+    # Single pass through ObjectData files
+    for file_path in archive.iter_glob("ObjectData/**/*.xml"):
+        filename = file_path.split("/")[-1]  # Get just the filename
+        if filename in entity_names_set:
+            entity_name = filename[:-4]  # Remove .xml extension
+            logger.info(f"Found {entity_name}: {file_path}")
+
+            try:
+                # Deserialize the file
+                manifest = archive.deserialize(file_path, ser)
+                serializable_data = _op_to_dict(type_list, manifest)
+
+                # Store both path and data
+                entity_data_map[entity_name] = {
+                    "file_path": file_path,
+                    "data": serializable_data
+                }
+
+                # Debug mode: write JSON files
+                if DEV_MODE:
+                    await _debug_write_entity_json(entity_name, serializable_data)
+
+                # Check for StateObjects in m_assetName and log ALL assets
+                behaviors = serializable_data.get("m_behaviors", [])
+                for behavior in behaviors:
+                    if behavior and isinstance(behavior, dict):
+                        if "m_assetName" in behavior:
+                            asset_name = behavior["m_assetName"]
+
+                            # Log ALL assets to file
+                            await _log_asset_to_file(entity_name, asset_name, zone_name)
+
+                            logger.info(f"Found asset for {entity_name}: {asset_name}")
+
+                            # Log asset discovery (NIF processing now handled in entity collision extraction)
+                            if asset_name.startswith("StateObjects"):
+                                logger.success(f"Found StateObjects asset for {entity_name}: {asset_name}")
+                            elif asset_name.endswith(".nif"):
+                                logger.debug(f"Found NIF asset for {entity_name}: {asset_name}")
+
+            except Exception as e:
+                logger.error(f"Failed to deserialize {entity_name}: {e}")
+
+    # Log any entities that weren't found
+    found_entities = set(entity_data_map.keys())
+    missing_entities = set(entity_names) - found_entities
+    if missing_entities:
+        logger.warning(f"Could not find files for entities: {missing_entities}")
+
+    logger.info(f"Found {len(entity_data_map)} out of {len(entity_names)} entities")
+    return entity_data_map
+
+
+async def _get_entity_collision_shapes(client: Client, static_body_radius: float, player_height: float) -> list[Polygon]:
+    """
+    Gets entities and creates accurate collision shapes using NIF data with player height awareness.
+    Uses height-aware NIF extraction for complex shapes, bounding boxes for fallbacks.
+    
+    Args:
+        client: Game client for accessing entity data
+        static_body_radius: Default radius for non-character entities
+        player_height: Player height for height-aware collision sampling
     """
     logger.info("Getting dynamic entity collision shapes...")
     entity_shapes = []
     try:
         entity_list = await client.get_base_entity_list()
+
+        # Collect all entity names first
+        entity_names = []
         for entity in entity_list:
             entity_name = await entity.object_name()
+            entity_names.append(entity_name)
+
+        # Single katsuba search for all entities
+        entity_data_map = await _setup_katsuba_search(client, entity_names)
+
+        # Now process each entity with its found data
+        for entity in entity_list:
+            entity_name = await entity.object_name()
+            entity_info = entity_data_map.get(entity_name)
+
             if entity_name == "Player Object":
                 continue
 
+            # Skip collision detection for trigger entities - we need to walk through them
+            if ("trigger" in entity_name.lower() or 
+                "door" in entity_name.lower() or 
+                entity_name.startswith("DynaTrigger_")):
+                logger.debug(f"Skipping collision for trigger entity: {entity_name}")
+                continue
+
             entity_loc = await entity.location()
-            entity_radius = 0.0
+            collision_shape = None
 
-            # NEW LOGIC: Default to static radius unless it's a character.
-            actor_body = await entity.actor_body()
+            # Try to get NIF-based collision shape if we have asset data
+            nif_found = False
+            if entity_info:
+                file_path = entity_info["file_path"]
+                data = entity_info["data"]
+                logger.debug(f"Processing {entity_name} from {file_path}")
+                
+                # Look for asset paths in the entity data
+                try:
+                    serializable_data = data
+                    behaviors = serializable_data.get("m_behaviors", [])
+                    for behavior in behaviors:
+                        if behavior and isinstance(behavior, dict):
+                            if "m_assetName" in behavior:
+                                asset_name = behavior["m_assetName"]
+                                if asset_name.endswith(".nif"):
+                                    nif_found = True
+                                    logger.debug(f"Attempting NIF collision extraction for {entity_name}: {asset_name}")
+                                    try:
+                                        collision_shape = await get_entity_collision_shape(client, entity_name, asset_name, player_height)
+                                        break  # Use first NIF found
+                                    except Exception as e:
+                                        logger.warning(f"Failed to get NIF collision for {entity_name}: {e}")
+                except Exception as e:
+                    logger.debug(f"Error processing entity data for {entity_name}: {e}")
 
-            # Check for actor_body and if its type is CharacterBody
-            if actor_body and await actor_body.read_type_name() == "CharacterBody":
-                entity_height = await actor_body.height()
-                entity_scale = await actor_body.scale()
-                entity_radius = entity_height * entity_scale * 0.5
-                logger.debug(f"Calculating dynamic radius for '{entity_name}' (CharacterBody): {entity_radius:.2f}")
+            # If no NIF found, skip this entity (assume no collision)
+            if not nif_found:
+                logger.debug(f"No NIF found for {entity_name}, skipping collision (assumed no collision)")
+                continue
+
+            # Handle different collision shape types from NIF processing
+            if isinstance(collision_shape, Polygon):
+                # Single polygon - translate to entity location
+                from shapely.affinity import translate
+                translated_shape = translate(collision_shape, xoff=entity_loc.x, yoff=entity_loc.y)
+                entity_shapes.append(translated_shape)
+                logger.debug(f"Used single NIF collision polygon for {entity_name}")
+            elif isinstance(collision_shape, list):
+                # Multiple polygons (e.g., chair legs) - translate each one
+                from shapely.affinity import translate
+                for i, poly in enumerate(collision_shape):
+                    if isinstance(poly, Polygon):
+                        translated_poly = translate(poly, xoff=entity_loc.x, yoff=entity_loc.y)
+                        entity_shapes.append(translated_poly)
+                logger.success(f"Used {len(collision_shape)} NIF collision polygons for {entity_name}")
+            elif isinstance(collision_shape, (int, float)) and collision_shape > 0:
+                # Radius fallback from NIF processing - use bounding box approximation for better accuracy
+                entity_radius = collision_shape
+                logger.debug(f"Using NIF-derived radius for {entity_name}: {entity_radius:.2f}")
+                # Create a square bounding box instead of a circle for better collision approximation
+                from shapely.geometry import box
+                bbox = box(entity_loc.x - entity_radius, entity_loc.y - entity_radius,
+                          entity_loc.x + entity_radius, entity_loc.y + entity_radius)
+                entity_shapes.append(bbox)
+                logger.debug(f"Created bounding box collision for {entity_name} (more accurate than circle)")
             else:
-                # Apply static radius to ALL other cases (StaticBody, bodiless ClientObjects, etc.)
-                entity_radius = static_body_radius
-                actor_type_str = await actor_body.read_type_name() if actor_body else "None"
-                logger.debug(
-                    f"Applying static radius for '{entity_name}' (Type: {actor_type_str}): {entity_radius:.2f}")
-
-            if entity_radius > 0:
-                entity_shapes.append(Point(entity_loc.x, entity_loc.y).buffer(entity_radius))
+                # NIF processing failed, but we know there should be a NIF - use CharacterBody fallback only
+                actor_body = await entity.actor_body()
+                if actor_body and await actor_body.read_type_name() == "CharacterBody":
+                    entity_height = await actor_body.height()
+                    entity_scale = await actor_body.scale()
+                    entity_radius = entity_height * entity_scale * 0.5
+                    logger.debug(f"NIF failed, using CharacterBody bounding box for '{entity_name}': {entity_radius:.2f}")
+                    if entity_radius > 0:
+                        # Use bounding box instead of circle for CharacterBody entities too
+                        from shapely.geometry import box
+                        bbox = box(entity_loc.x - entity_radius, entity_loc.y - entity_radius,
+                                  entity_loc.x + entity_radius, entity_loc.y + entity_radius)
+                        entity_shapes.append(bbox)
+                        logger.debug(f"Created CharacterBody bounding box collision for {entity_name}")
+                else:
+                    logger.debug(f"NIF failed and no CharacterBody for {entity_name}, skipping collision")
 
     except Exception as e:
         logger.error(f"An error occurred while getting entity collision shapes: {e}", exc_info=True)
 
-    logger.success(f"Generated {len(entity_shapes)} collision shapes from dynamic entities.")
+    # Enhanced collision summary logging
+    if entity_shapes:
+        polygon_count = sum(1 for shape in entity_shapes if hasattr(shape, 'geom_type') and shape.geom_type == 'Polygon')
+        bbox_count = len(entity_shapes) - polygon_count
+        logger.success(f"Generated {len(entity_shapes)} collision shapes from dynamic entities:")
+        logger.info(f"  - {polygon_count} NIF-based polygon shapes (accurate geometry)")
+        logger.info(f"  - {bbox_count} bounding box approximations (improved from circles)")
+    else:
+        logger.info("No entity collision shapes generated.")
+    
     return entity_shapes
+
 
 
 def _export_collision_polygons(file_path: Path, shapes: List[Polygon]):
@@ -153,13 +958,17 @@ def _plot_collision_map(
 
     if mesh_shapes:
         for m in mesh_shapes:
-            ax.add_patch(
-                MplPoly(list(m.exterior.coords), closed=True, fill=True, alpha=0.2, edgecolor='green', linewidth=1))
+            # Validate geometry type before accessing .exterior
+            if hasattr(m, 'geom_type') and m.geom_type == 'Polygon' and hasattr(m, 'exterior'):
+                ax.add_patch(
+                    MplPoly(list(m.exterior.coords), closed=True, fill=True, alpha=0.2, edgecolor='green', linewidth=1))
 
     if coll_shapes:
         for c in coll_shapes:
-            ax.add_patch(
-                MplPoly(list(c.exterior.coords), closed=True, fill=True, alpha=0.3, edgecolor='red', linewidth=1))
+            # Validate geometry type before accessing .exterior
+            if hasattr(c, 'geom_type') and c.geom_type == 'Polygon' and hasattr(c, 'exterior'):
+                ax.add_patch(
+                    MplPoly(list(c.exterior.coords), closed=True, fill=True, alpha=0.3, edgecolor='red', linewidth=1))
 
     ax.plot(player_pos.x, player_pos.y, 'bo', markersize=8, label='Player Start')
     ax.plot(target_pos.x, target_pos.y, 'rx', markersize=12, mew=2, label='Quest Target')
@@ -256,9 +1065,36 @@ async def _perform_single_teleport_attempt(
         logger.error("Safe region is empty after buffering. Cannot find a teleport point.")
         return False
 
-    _, pt2 = nearest_points(Point(target.x, target.y), safe_region)
-    safe_pt = XYZ(pt2.x, pt2.y, target.z)
-    logger.info(f"Calculated candidate safe_pt: {safe_pt}")
+    # Use radius offset to progressively search further from target
+    # Higher offset = search further away from problematic target area
+    search_distance = (player_radius_offset - 1.0) * 300  # 0, 60, 120, 180, 240 units away
+    target_point = Point(target.x, target.y)
+    
+    if search_distance <= 0:
+        # First attempt: try nearest point to exact target
+        _, candidate_pt = nearest_points(target_point, safe_region)
+        safe_pt = XYZ(candidate_pt.x, candidate_pt.y, target.z)
+        logger.info(f"Calculated nearest safe_pt to target: {safe_pt}")
+    else:
+        # Later attempts: look for safe areas further from the problematic target location
+        target_area = target_point.buffer(search_distance)
+        intersection = target_area.intersection(safe_region)
+        
+        if intersection and not intersection.is_empty:
+            # Find a point in the safe area that's roughly the search distance away
+            if hasattr(intersection, 'centroid'):
+                candidate_pt = intersection.centroid
+            else:
+                # Fallback to boundary if no centroid
+                candidate_pt = intersection.boundary.centroid if hasattr(intersection, 'boundary') else target_point
+            
+            safe_pt = XYZ(candidate_pt.x, candidate_pt.y, target.z)
+            logger.info(f"Calculated alternative safe_pt at ~{search_distance:.0f} units from target: {safe_pt}")
+        else:
+            # Fallback to nearest point if no intersection found
+            _, candidate_pt = nearest_points(target_point, safe_region)
+            safe_pt = XYZ(candidate_pt.x, candidate_pt.y, target.z)
+            logger.info(f"Fallback to nearest safe_pt (no intersection at distance {search_distance:.0f}): {safe_pt}")
 
     cx = min(max(safe_pt.x, minx), maxx)
     cy = min(max(safe_pt.y, miny), maxy)
@@ -315,6 +1151,11 @@ async def _perform_single_teleport_attempt(
             return False
     else:
         logger.error("Teleport to safe point FAILED. Player was likely rubber-banded.")
+        
+        # Add the failed teleport location as a dynamic collision zone
+        zone_name = await client.zone_name()
+        await _add_or_expand_dynamic_collision_zone(safe_pt, zone_name, player_radius, client)
+        
         return False
 
 
@@ -322,10 +1163,10 @@ async def _perform_single_teleport_attempt(
 
 async def WorldsCollideTP(
         client: Client,
-        player_radius_offset: float = 0.5,
+        player_radius_offset: float = 1,
         static_body_radius: float = 75.0,
         plots: bool = True,
-        debug: bool = False
+        debug: bool = True
 ):
     """
     Handles teleportation to a quest target by calculating a safe path around ALL collision geometry,
@@ -341,10 +1182,30 @@ async def WorldsCollideTP(
     logger.info(f"Quest ID: {quest_id}")
 
     world, static_coll_shapes, mesh_shapes = await _load_and_build_collision_geometry(client, target.z, debug)
-    entity_coll_shapes = await _get_entity_collision_shapes(client, static_body_radius)
+    
+    # Get player height early for height-aware collision detection
+    player_height = await client.body.height()
+    player_scale = await client.body.scale()
+    logger.debug(f"Player height: {player_height:.1f}, scale: {player_scale:.2f}")
+    
+    entity_coll_shapes = await _get_entity_collision_shapes(client, static_body_radius, player_height)
 
-    all_coll_shapes = static_coll_shapes + entity_coll_shapes
-    logger.info(f"Total collision objects (static + dynamic): {len(all_coll_shapes)}")
+    # Filter out any invalid geometries to prevent LineString crashes
+    static_coll_shapes = filter_valid_polygons(static_coll_shapes)
+    entity_coll_shapes = filter_valid_polygons(entity_coll_shapes)
+    mesh_shapes = filter_valid_polygons(mesh_shapes)
+
+    # Add dynamic collision zones discovered from previous rubber-band failures
+    zone_name = await client.zone_name()
+    
+    # Load any previously saved dynamic collision zones for this zone
+    await _load_dynamic_collision_zones(client, zone_name)
+    
+    dynamic_coll_shapes = _get_dynamic_collision_polygons(zone_name)
+    dynamic_coll_shapes = filter_valid_polygons(dynamic_coll_shapes)
+
+    all_coll_shapes = static_coll_shapes + entity_coll_shapes + dynamic_coll_shapes
+    logger.info(f"Total collision objects (static + dynamic + learned): {len(static_coll_shapes)} + {len(entity_coll_shapes)} + {len(dynamic_coll_shapes)} = {len(all_coll_shapes)}")
 
     _export_collision_polygons(output_file_path, all_coll_shapes + mesh_shapes)
 
@@ -361,11 +1222,14 @@ async def WorldsCollideTP(
     logger.info(f"Instance bounds: X[{bounds[0]:.1f},{bounds[2]:.1f}]  Y[{bounds[1]:.1f},{bounds[3]:.1f}]")
 
     if plots:
+        # Generate enhanced collision plots
+        zone_name = await client.zone_name()
+        generate_collision_plots(static_coll_shapes, entity_coll_shapes, player_pos, target, target, zone_name, debug=True)
+        
+        # Also generate the original combined plot for backward compatibility
         _plot_collision_map(sane_zone_name, "initial_map_with_entities", player_pos, target, quest_id, mesh_shapes,
                             all_coll_shapes)
 
-    player_height = await client.body.height()
-    player_scale = await client.body.scale()
     base_player_radius = player_height * player_scale * 0.5
     player_radius = base_player_radius * player_radius_offset
     logger.info(f"Estimated player radius (offset applied): {player_radius:.2f}")
@@ -376,11 +1240,28 @@ async def WorldsCollideTP(
         logger.info(
             "Quest target is clear of all known collision objects. Attempting direct teleport...")
         start_zone_name = await client.zone_name()
+        start_position = await client.body.position()
+        
         await client.teleport(target)
         await asyncio.sleep(3)
-        if await client.is_loading() or start_zone_name != await client.zone_name():
+        
+        # Validate teleport success by checking position and zone changes
+        end_position = await client.body.position()
+        end_zone_name = await client.zone_name()
+        
+        # Calculate distance moved
+        distance_moved = ((end_position.x - start_position.x) ** 2 + 
+                         (end_position.y - start_position.y) ** 2) ** 0.5
+        
+        if await client.is_loading() or start_zone_name != end_zone_name:
             logger.success("Direct teleport resulted in a zone change.")
-        return
+            return
+        elif distance_moved > 100:  # Minimum significant movement threshold
+            logger.success(f"Direct teleport successful - moved {distance_moved:.1f} units.")
+            return
+        else:
+            logger.warning(f"Direct teleport failed - only moved {distance_moved:.1f} units. Falling back to collision pathfinding.")
+            # Continue to collision-based pathfinding below
 
     logger.warning("Quest target is inside a combined collision object. Calculating safe teleport point.")
 

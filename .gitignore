@@ -39,3 +39,27 @@ __pycache__/
 /.claude/settings.local.json
 /questing.py
 /quest_test.py
+/debug_entity_search.py
+/debug_missing_types.py
+/test_json_typelist.py
+/test_katsuba_classes.py
+/test_katsuba_comprehensive.py
+/test_katsuba_integration.py
+/test_katsuba_manual.py
+/test_katsuba.py
+/test_ms_burntower3.py
+/test_proper_serializer.py
+/test_serializer_creation.py
+/test_serializer.py
+/test_serializer2.py
+/test_serializer3.py
+/test_stateful_approach.py
+/test_string_typelist.py
+/test_type_coverage.py
+/test_typelist.py
+/test_unpacked_file.py
+/test_wiztype.py
+/test.py
+/types/r777602.Wizard_1_580_0_Live.json
+/entities/
+/asset logs/

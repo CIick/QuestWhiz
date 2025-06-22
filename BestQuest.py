@@ -1,5 +1,6 @@
 import inspect
 import re
+import time
 from typing import Any, Coroutine, List, Dict, Tuple
 from pathlib import Path
 import asyncio
@@ -198,6 +199,11 @@ class BestQuest:
         self.client = client
         self.db_logger = db_logger
         self.state_manager = PlayerStateManager(client)
+        self.last_sigil_exit_time = 0 # Track when we last exited a sigil
+        self.sigil_grace_period = 5 # seconds to avoid re-entering immediately
+        self.last_npc_dialogue_handled_time = 0.0
+        self.npc_dialogue_cooldown = 5.0 # seconds to ignore new NPC interaction pop-ups
+
         self.goal_handlers = {
             GoalType.unknown: self._handle_unimplemented_goal,
             GoalType.bounty: self._handle_bounty_goal,
@@ -301,53 +307,165 @@ class BestQuest:
 
     # <editor-fold desc="Action Handlers">
 
-    async def _handle_dialogue(self):
+    async def _handle_dialogue(self) -> bool:
         # Small delay to catch any dialogue that might be appearing
         await asyncio.sleep(0.2)
-        
+
+        current_time = time.time()
+
+        # Always apply NPC dialogue cooldown if an interaction was just handled,
+        # regardless of zone comparison for the *current* goal.
+        # This prevents immediate re-engagement with NPCs after a successful dialogue.
+        if current_time - self.last_npc_dialogue_handled_time < self.npc_dialogue_cooldown:
+            logger.debug(
+                f"Skipping NPC dialogue handling due to cooldown. Time remaining: {self.npc_dialogue_cooldown - (current_time - self.last_npc_dialogue_handled_time):.2f}s")
+            return False  # Indicate that we are intentionally skipping this interaction
+
         # Check for sigil entry dialog first
         if await is_visible_by_path(self.client, npc_range_path):
             popup_text = await Utils.read_popup_text(self.client)
             if "to enter" in popup_text.lower():
                 logger.warning("Sigil dialog detected - handling sigil entry...")
-                return await self._handle_sigil_entry()
-        
-        # Handle normal dialogue interactions
+                handled_sigil = await self._handle_sigil_entry()
+                if handled_sigil:
+                    self.last_npc_dialogue_handled_time = time.time()  # Update timestamp after successful sigil handling
+                return handled_sigil
+
+        # Handle initial NPC interaction pop-up (pressing 'X')
+        # This is the prompt to initiate dialogue with an NPC
         if await is_visible_by_path(self.client, popup_title_path):
             logger.warning("Initial NPC interaction pop-up detected. Pressing 'X' to engage.")
             await self.client.send_key(Keycode.X, 0.1)
             await asyncio.sleep(1.0)
+            # After pressing X, it's very likely to go into dialogue.
+            # We will update last_npc_dialogue_handled_time upon successful dialogue handling.
 
-        # Use the new PlayerStateManager for safe dialogue handling
+        # Now check for actual dialogue being present (the larger dialogue window)
         if await self.state_manager.is_in_dialogue():
             logger.warning("Dialogue detected - handling safely...")
             handled = await self.state_manager.handle_dialogue_safely()
             if handled:
                 logger.success("Dialogue handled successfully.")
+                self.last_npc_dialogue_handled_time = time.time()  # Update timestamp after successful dialogue
                 return True
-            
+
         return False
 
     async def _handle_sigil_entry(self) -> bool:
-        if await is_visible_by_path(self.client, npc_range_path):
-            popup_text = await Utils.read_popup_text(self.client)
-            if "to enter" in popup_text.lower():
-                logger.warning("Dungeon sigil detected. Attempting to enter...")
-                await self.client.send_key(Keycode.X, 0.1)
-                await asyncio.sleep(1.0)
+        # Check if the sigil UI is even visible
+        if not await is_visible_by_path(self.client, npc_range_path):
+            return False
 
-                if await is_visible_by_path(self.client, dungeon_warning_path):
-                    logger.info("Confirming dungeon entry...")
-                    await click_window_by_path(self.client, dungeon_warning_path)
+        # Read popup text to determine context
+        popup_text = await Utils.read_popup_text(self.client)
+        if "to enter" not in popup_text.lower():
+            # Not a sigil entry dialog, so don't handle here
+            return False
 
-                logger.info("Waiting for zone change after entering sigil...")
-                while not await self.client.is_loading():
-                    await asyncio.sleep(0.2)
-                logger.success("Entered dungeon.")
-                while await self.client.is_loading():
-                    await asyncio.sleep(0.2)
-                return True
-        return False
+        logger.warning("Dungeon sigil entry dialog detected.")
+
+        # --- NEW LOGIC: Prevent immediate re-entry after recent exit ---
+        current_time = asyncio.get_event_loop().time()
+        if current_time - self.last_sigil_exit_time < self.sigil_grace_period:
+            # Check if player has moved far enough from where they exited
+            player_pos = await self.client.body.position()
+            # You would need to store the exit position from the sigil
+            # For now, let's assume if it's within the grace period, we just skip re-entry
+            # A more robust solution would store the exit location and check distance from it.
+            logger.info(f"Within sigil grace period ({self.sigil_grace_period}s). Skipping re-entry attempt.")
+            return False  # Indicate that we saw the UI but chose not to act
+
+        # --- Your Proposed Radius Check (incorporating quest goal context) ---
+        quest_manager = await self.client.quest_manager()
+        character_registry = await self.client.character_registry()
+        active_quest_id = await character_registry.active_quest_id()
+
+        if active_quest_id:
+            all_quests = await quest_manager.quest_data()
+            active_quest = all_quests.get(active_quest_id)
+            if active_quest:
+                on_screen_text = await Utils.get_on_screen_goal_text(self.client)
+                all_goals = await active_quest.goal_data()
+                identified_goal_id, identified_goal = await self._find_goal_by_text_matching(on_screen_text, all_goals)
+
+                if identified_goal:
+                    quest_target_pos = await self.client.quest_position.position()  # This is the main quest position
+                    player_pos = await self.client.body.position()
+
+                    # Define a "near sigil" radius - needs tuning
+                    # This could be the player's interaction range or a bit larger
+                    sigil_interaction_radius = 500  # Example value, adjust as needed
+
+                    distance_to_quest_target = ((player_pos.x - quest_target_pos.x) ** 2 + 
+                                               (player_pos.y - quest_target_pos.y) ** 2) ** 0.5
+
+                    # Check if the quest goal requires entering a sigil (e.g., goal_type, or specific madlib text)
+                    # For simplicity, let's assume if the player is far from the target, and we are at a sigil UI, we should enter.
+                    # Or, more precisely, if the QUEST TARGET is still *inside* the dungeon the sigil leads to.
+                    # This might require pre-mapping zones to their sigils.
+
+                    # A more direct check: if the *current goal's destination zone* is different from the current zone, AND the quest target
+                    # is "close enough" to the sigil UI, then it's likely we need to enter.
+                    goal_dest_zone = await identified_goal.goal_destination_zone()
+                    current_zone = await self.client.zone_name()
+
+                    # If goal destination zone is different from current zone, we likely need to enter
+                    # AND the quest target is within a reasonable distance to the sigil (which is where the player is).
+                    # This assumes quest_position points to something inside the sigil when you need to enter.
+                    if goal_dest_zone and goal_dest_zone != current_zone:
+                        logger.info(
+                            f"Current goal destination zone ('{goal_dest_zone}') differs from current zone ('{current_zone}').")
+                        # Here, you might also want to check if quest_target_pos is within the known bounds of the sigil itself
+                        # but for now, rely on the simple distance to player
+                        # A more advanced check: if the target_pos is in a known "dungeon zone" and player is outside
+                        pass  # Proceed to enter sigil logic below
+                    else:
+                        logger.warning(
+                            f"Sigil UI detected, but current goal destination ('{goal_dest_zone}') is same as current zone ('{current_zone}'). Skipping re-entry.")
+                        return False  # Don't enter if we're already in the target zone for the goal
+                else:
+                    logger.warning("No identified active goal, skipping sigil re-entry logic.")
+                    return False
+            else:
+                logger.warning("No active quest found, skipping sigil re-entry logic.")
+                return False
+
+        logger.info("Attempting to enter sigil...")
+        await self.client.send_key(Keycode.X, 0.1)
+        await asyncio.sleep(1.0)  # Give it a moment for the warning/loading screen
+
+        if await is_visible_by_path(self.client, dungeon_warning_path):
+            logger.info("Confirming dungeon entry...")
+            await click_window_by_path(self.client, dungeon_warning_path)
+            await asyncio.sleep(0.5)
+
+        logger.info("Waiting for zone change after entering sigil...")
+        zone_before_loading = await self.client.zone_name()
+
+        # Wait for the loading screen to appear and then disappear
+        start_wait_time = asyncio.get_event_loop().time()
+        while not await self.client.is_loading():
+            if asyncio.get_event_loop().time() - start_wait_time > 20:  # Timeout for loading screen to appear
+                logger.warning("Loading screen did not appear after sigil entry attempt. Assume failed or already in.")
+                return False
+            await asyncio.sleep(0.1)
+
+        while await self.client.is_loading():
+            await asyncio.sleep(0.1)
+
+        # After loading, check if the zone actually changed
+        zone_after_loading = await self.client.zone_name()
+        if zone_after_loading != zone_before_loading:
+            logger.success(f"Entered dungeon: Zone changed from '{zone_before_loading}' to '{zone_after_loading}'.")
+            # Store the current time as the last sigil exit time to prevent immediate re-entry if we exit soon
+            self.last_sigil_exit_time = asyncio.get_event_loop().time()
+            # Also store current position to check distance moved if grace period is active
+            self.last_sigil_exit_pos = await self.client.body.position()
+            return True
+        else:
+            logger.warning(
+                "Sigil entry attempt completed, but zone did not change. Player might already be in dungeon or entry failed.")
+            return False
 
     async def _cycle_new_portal(self, location_name: str):
         logger.warning(f"Advanced portal logic for location '{location_name}' is not yet implemented.")
@@ -356,7 +474,23 @@ class BestQuest:
     async def _handle_spiral_door(self, destination_zone: str) -> bool:
         if not await is_visible_by_path(self.client, spiral_door_teleport_path):
             return False
-
+        ''' HANDEL "WAIT TRY AGIAN IN A SECOND WIZARD"
+-- [MessageBoxModalWindow] Window
+--- [messageBoxBG] Window
+---- [Top] ControlSprite
+---- [Bottom] ControlSprite
+---- [Left] ControlSprite
+---- [Right] ControlSprite
+---- [TopLeft] ControlSprite
+---- [TopRight] ControlSprite
+---- [BottomLeft] ControlSprite
+---- [TopLeft] ControlSprite
+---- [messageBoxLayout] WindowLayout
+----- [TitleCtrl] ControlText
+----- [MsgCtrl] ControlText
+----- [AdjustmentWindow] Window
+------ [RetryBtn] ControlButton
+------ [CancelBtn] ControlButton'''
         logger.info("Spiral Door UI is open. Checking if travel is needed...")
 
         current_world = Utils.get_world_from_zone(await self.client.zone_name())
@@ -432,7 +566,7 @@ class BestQuest:
     # <editor-fold desc="Movement Logic">
     async def _travel_to_goal_location(self, goal: GoalData):
         destination_zone = await goal.goal_destination_zone()
-        max_failed_attempts = 5
+        max_failed_attempts = 10
         failed_attempts = 0
         # Get the actual goal ID from the quest system for proper tracking
         quest_manager = await self.client.quest_manager()
@@ -448,7 +582,10 @@ class BestQuest:
                     if quest_goal == goal:
                         initial_goal_id = goal_id
                         break
-        player_radius_offset = 0.5  # Start with default radius
+        player_radius_offset = 1  # Start with default radius
+        
+        # Initialize position tracking for progress detection
+        position_before_action = await self.client.body.position()
         
         # Track if we just switched worlds to avoid unnecessary UI handling
         initial_world = Utils.get_world_from_zone(await self.client.zone_name())
@@ -488,6 +625,7 @@ class BestQuest:
                             break
 
             zone_before_action = current_zone
+            position_before_action = await self.client.body.position()
 
             # Check if we just switched worlds in this loop iteration
             current_world = Utils.get_world_from_zone(current_zone)
@@ -525,7 +663,7 @@ class BestQuest:
             if current_zone_after_ui != zone_before_action:
                 logger.success("UI interaction resulted in a zone change. Re-evaluating position.")
                 # Reset radius offset after successful zone change
-                player_radius_offset = 0.5
+                player_radius_offset = 1
                 # Update world tracking since we changed zones
                 initial_world = Utils.get_world_from_zone(current_zone_after_ui)
                 continue
@@ -544,7 +682,7 @@ class BestQuest:
                     zone_after_dialogue = await self.client.zone_name()
                     if zone_after_dialogue != zone_before_action:
                         logger.success("Post-teleportation dialogue handling resulted in zone change.")
-                        player_radius_offset = 0.5
+                        player_radius_offset = 1
                         # Update world tracking since we changed zones
                         initial_world = Utils.get_world_from_zone(zone_after_dialogue)
                         continue
@@ -568,18 +706,34 @@ class BestQuest:
                     player_radius_offset = min(player_radius_offset + 0.2, 1.5)
                     continue
 
-                # Check if WorldsCollideTP made progress (only after handling all UI)
+                # Check if WorldsCollideTP made progress (zone change or significant position change)
                 zone_after_tp = await self.client.zone_name()
-                if zone_after_tp == zone_before_action:
-                    logger.error("No progress made in this travel attempt.")
+                position_after_tp = await self.client.body.position()
+                
+                # Calculate distance moved
+                distance_moved = ((position_after_tp.x - position_before_action.x) ** 2 + 
+                                (position_after_tp.y - position_before_action.y) ** 2) ** 0.5
+                
+                zone_changed = zone_after_tp != zone_before_action
+                significant_movement = distance_moved > 200  # Minimum progress threshold
+                
+                if zone_changed or significant_movement:
+                    if zone_changed:
+                        logger.success(f"Zone change detected: {zone_before_action} → {zone_after_tp}")
+                    else:
+                        logger.success(f"Significant movement detected: {distance_moved:.1f} units")
+                    
+                    # Reset radius offset after successful movement
+                    player_radius_offset = 1
+                    # Update world tracking in case we moved to a new world
+                    initial_world = Utils.get_world_from_zone(zone_after_tp)
+                    # Update position tracking for next iteration
+                    position_before_action = position_after_tp
+                else:
+                    logger.error(f"No progress made in this travel attempt (moved {distance_moved:.1f} units, zone unchanged).")
                     failed_attempts += 1
                     # Increase radius offset to avoid getting stuck in same location
                     player_radius_offset = min(player_radius_offset + 0.2, 1.5)
-                else:
-                    # Reset radius offset after successful movement
-                    player_radius_offset = 0.5
-                    # Update world tracking in case we moved to a new world
-                    initial_world = Utils.get_world_from_zone(zone_after_tp)
         else:
             logger.error(
                 f"Failed to reach destination zone '{destination_zone}' after {max_failed_attempts} failed attempts.")
@@ -759,6 +913,7 @@ class BestQuest:
 
         # Initial check for blocking UI before starting the main logic
         zone_before_action = await self.client.zone_name()
+        position_before_action = await self.client.body.position()
         
         # Wait for player to be free before starting quest logic
         await self._wait_for_free_state(timeout=15.0)
@@ -800,7 +955,7 @@ class BestQuest:
         handler_method = self.goal_handlers.get(goal_type, self._handle_unimplemented_goal)
 
         logger.info(f"Processing active goal of type '{goal_type.name}'...")
-        input("Quest Auditor -> Press Enter to after looking at the type of goal.")
+        # input("Quest Auditor -> Press Enter to after looking at the type of goal.")
 
         await handler_method(active_goal)
 
@@ -830,13 +985,13 @@ async def main():
 
         logger.info("Script running. Press NINE to process the current quest, or END to exit.")
         while True:
-            if keyboard.is_pressed('9'):
-                await best_quest.run()
-                logger.info("Quest processing complete. Restarting quest processing loop...")
-                await asyncio.sleep(2.0)  # Brief pause before reprocessing
-            if keyboard.is_pressed('end'):
-                logger.info("Exit key pressed. Shutting down.")
-                break
+            # if keyboard.is_pressed('9'):
+            await best_quest.run()
+            logger.info("Quest processing complete. Restarting quest processing loop...")
+            await asyncio.sleep(2.0)  # Brief pause before reprocessing
+            # if keyboard.is_pressed('end'):
+            #     logger.info("Exit key pressed. Shutting down.")
+            #     break
 
     except IndexError:
         logger.error("No Wizard101 client found.")
