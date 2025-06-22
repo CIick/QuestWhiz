@@ -127,7 +127,8 @@ class Utils:
             return ""
         try:
             return await client.cache_handler.get_langcode_name(lang_key)
-        except Exception:
+        except Exception as e:
+            logger.error(f"[UTILS] Error translating lang key '{lang_key}': {e}", exc_info=True)
             return lang_key
 
     @staticmethod
@@ -164,7 +165,8 @@ class Utils:
         try:
             quest_name = await get_window_from_path(client.root_window, quest_name_path)
             quest = await quest_name.maybe_text()
-        except Exception:
+        except Exception as e:
+            logger.error(f"[UTILS] Error reading quest text: {e}", exc_info=True)
             quest = ""
         return quest
 
@@ -173,7 +175,8 @@ class Utils:
         try:
             title_text_path = await get_window_from_path(client.root_window, spiral_door_title_path)
             title = await title_text_path.maybe_text()
-        except:
+        except Exception as e:
+            logger.error(f"[UTILS] Error reading spiral door title: {e}", exc_info=True)
             title = ""
         return title
 
@@ -182,7 +185,8 @@ class Utils:
         try:
             popup_text_path = await get_window_from_path(p.root_window, popup_msgtext_path)
             txtmsg = await popup_text_path.maybe_text()
-        except:
+        except Exception as e:
+            logger.error(f"[UTILS] Error reading popup text: {e}", exc_info=True)
             txtmsg = ""
         return txtmsg
 
@@ -203,6 +207,11 @@ class BestQuest:
         self.sigil_grace_period = 5 # seconds to avoid re-entering immediately
         self.last_npc_dialogue_handled_time = 0.0
         self.npc_dialogue_cooldown = 5.0 # seconds to ignore new NPC interaction pop-ups
+        
+        # Quest/Goal change tracking
+        self.current_quest_id = None
+        self.current_goal_id = None
+        self.current_goal_type = None
 
         self.goal_handlers = {
             GoalType.unknown: self._handle_unimplemented_goal,
@@ -251,6 +260,10 @@ class BestQuest:
             f"  Pet Only: {await quest.pet_only_quest()}"
         )
 
+        # Add complete quest inspection for research
+        logger.warning("[QUEST_DETAILS] Performing complete quest object inspection for research...")
+        await self._inspect_object_completely(quest, f"QuestData_Details_{quest_id}", 0)
+
         quest_goals = await quest.goal_data()
         print("  Goals:")
         if not quest_goals:
@@ -260,6 +273,10 @@ class BestQuest:
                 display_goal_id = goal_id & 0xFFFFFFFF
                 print(f"    - Goal ID: {display_goal_id} (Full: {goal_id})")
                 await self._print_goal_details(goal, indent=6)
+                
+                # Add complete goal inspection for research
+                logger.warning(f"[QUEST_DETAILS] Performing complete goal object inspection for goal {goal_id}...")
+                await self._inspect_object_completely(goal, f"GoalData_Details_{goal_id}", 0)
 
         print("=" * 60)
 
@@ -275,9 +292,16 @@ class BestQuest:
         client_tags = await goal.client_tag_list()
         if client_tags:
             await self._print_client_tags(client_tags, indent + 2)
+            # Deep ClientTagList inspection
+            logger.warning(f"[GOAL_DETAILS] Performing complete ClientTagList inspection...")
+            await self._inspect_object_completely(client_tags, f"ClientTagList_GoalDetails", indent // 2)
+            
         madlib = await goal.madlib_block()
         if madlib:
             await self._print_madlib_block(madlib, indent + 2)
+            # Deep MadlibBlock inspection  
+            logger.warning(f"[GOAL_DETAILS] Performing complete MadlibBlock inspection...")
+            await self._inspect_object_completely(madlib, f"MadlibBlock_GoalDetails", indent // 2)
 
     async def _print_client_tags(self, client_tag_list: ClientTagList, indent: int):
         indent_str = ' ' * indent
@@ -299,8 +323,8 @@ class BestQuest:
         for entry in entries:
             identifier = await entry.identifier()
             sub_quest_info_string = await entry.maybe_data_str()
-            final_sub_quest_info_string = await Utils.translate_lang_key(self.client, sub_quest_info_string)
-            print(f"{indent_str}  - Identifier: {await Utils.translate_lang_key(self.client, identifier)}")
+            final_sub_quest_info_string = await Utils.translate_lang_key(self.client, sub_quest_info_string) if sub_quest_info_string else None
+            print(f"{indent_str}  - Identifier: {identifier}")  # identifier is a field name, not a lang key
             print(f"{indent_str}    Final Value: {final_sub_quest_info_string or 'Empty'}")
 
     # </editor-fold>
@@ -308,6 +332,8 @@ class BestQuest:
     # <editor-fold desc="Action Handlers">
 
     async def _handle_dialogue(self) -> bool:
+        logger.debug("[DIALOGUE] Starting dialogue handling")
+        
         # Small delay to catch any dialogue that might be appearing
         await asyncio.sleep(0.2)
 
@@ -343,12 +369,22 @@ class BestQuest:
         # Now check for actual dialogue being present (the larger dialogue window)
         if await self.state_manager.is_in_dialogue():
             logger.warning("Dialogue detected - handling safely...")
+            
+            # Check for quest changes before dialogue handling
+            await self._check_quest_goal_changes("before_dialogue_handling")
+            
             handled = await self.state_manager.handle_dialogue_safely()
             if handled:
                 logger.success("Dialogue handled successfully.")
                 self.last_npc_dialogue_handled_time = time.time()  # Update timestamp after successful dialogue
+                
+                # Check for quest changes after dialogue handling
+                if await self._check_quest_goal_changes("after_dialogue_handling"):
+                    logger.warning("[DIALOGUE] Quest/goal changes detected after dialogue handling")
+                
                 return True
 
+        logger.debug("[DIALOGUE] No dialogue to handle")
         return False
 
     async def _handle_sigil_entry(self) -> bool:
@@ -592,6 +628,11 @@ class BestQuest:
         just_switched_worlds = False
 
         while failed_attempts < max_failed_attempts:
+            # Check for quest/goal changes at the start of each travel loop
+            if await self._check_quest_goal_changes(f"travel_loop_start_attempt_{failed_attempts + 1}"):
+                logger.warning("[TRAVEL] Quest/goal changes detected in travel loop, exiting travel")
+                break
+            
             current_zone = await self.client.zone_name()
             if not current_zone:
                 await asyncio.sleep(0.5)
@@ -658,6 +699,11 @@ class BestQuest:
                 ui_handled = False
                 logger.info("Skipped UI handling due to recent world switch. Proceeding directly to teleportation.")
 
+            # Check for quest/goal changes after UI handling
+            if await self._check_quest_goal_changes(f"travel_after_ui_attempt_{failed_attempts + 1}"):
+                logger.warning("[TRAVEL] Quest/goal changes detected after UI handling, exiting travel")
+                break
+            
             # Check if UI interaction caused a zone change
             current_zone_after_ui = await self.client.zone_name()
             if current_zone_after_ui != zone_before_action:
@@ -675,8 +721,18 @@ class BestQuest:
                     await WorldsCollideTP(self.client, player_radius_offset=player_radius_offset)
                     await asyncio.sleep(2.0)
                     
+                    # Check for quest/goal changes after teleportation
+                    if await self._check_quest_goal_changes(f"travel_after_teleport_attempt_{failed_attempts + 1}"):
+                        logger.warning("[TRAVEL] Quest/goal changes detected after teleportation, exiting travel")
+                        break
+                    
                     # IMMEDIATELY check for dialogue and UI that might appear after teleportation
                     await self._handle_dialogue()
+                    
+                    # Check for quest/goal changes after post-teleport dialogue
+                    if await self._check_quest_goal_changes(f"travel_after_post_teleport_dialogue_attempt_{failed_attempts + 1}"):
+                        logger.warning("[TRAVEL] Quest/goal changes detected after post-teleport dialogue, exiting travel")
+                        break
                     
                     # Check if dialogue handling caused a zone change
                     zone_after_dialogue = await self.client.zone_name()
@@ -754,17 +810,52 @@ class BestQuest:
 
     # <editor-fold desc="Goal Handlers">
     async def _handle_waypoint_goal(self, goal: GoalData):
-        logger.info("Handling WAYPOINT goal")
-        await self._travel_to_goal_location(goal)
+        try:
+            logger.info("Handling WAYPOINT goal")
+            await self._travel_to_goal_location(goal)
+        except Exception as e:
+            logger.error(f"[HANDLER] Error in waypoint goal handler: {e}", exc_info=True)
 
     async def _handle_persona_goal(self, goal: GoalData):
-        logger.info("Handling PERSONA goal.")
-        await self._travel_to_goal_location(goal)
-        await self._handle_dialogue()
+        try:
+            logger.info("Handling PERSONA goal.")
+            
+            # Check for changes before travel
+            if await self._check_quest_goal_changes("persona_before_travel"):
+                logger.warning("[HANDLER] Quest/goal changes detected before persona travel, aborting handler")
+                return
+            
+            await self._travel_to_goal_location(goal)
+            
+            # Check for changes after travel
+            if await self._check_quest_goal_changes("persona_after_travel"):
+                logger.warning("[HANDLER] Quest/goal changes detected after persona travel, aborting handler")
+                return
+                
+            await self._handle_dialogue()
+            
+            # Check for changes after dialogue
+            await self._check_quest_goal_changes("persona_after_dialogue")
+            
+        except Exception as e:
+            logger.error(f"[HANDLER] Error in persona goal handler: {e}", exc_info=True)
 
     async def _handle_usage_goal(self, goal: GoalData):
-        logger.info("Handling USAGE goal.")
-        await self._travel_to_goal_location(goal)
+        try:
+            logger.info("Handling USAGE goal.")
+            
+            # Check for changes before travel
+            if await self._check_quest_goal_changes("usage_before_travel"):
+                logger.warning("[HANDLER] Quest/goal changes detected before usage travel, aborting handler")
+                return
+            
+            await self._travel_to_goal_location(goal)
+            
+            # Check for changes after travel
+            await self._check_quest_goal_changes("usage_after_travel")
+            
+        except Exception as e:
+            logger.error(f"[HANDLER] Error in usage goal handler: {e}", exc_info=True)
 
     async def _handle_bounty_goal(self, goal: GoalData):
         logger.info("Handling BOUNTY goal.")
@@ -880,10 +971,254 @@ class BestQuest:
 
     # </editor-fold>
 
+    # <editor-fold desc="Object Inspection Utilities">
+    async def _inspect_object_completely(self, obj, obj_name: str, indent: int = 0):
+        """Comprehensively inspect any object and log ALL available data"""
+        indent_str = ' ' * indent
+        logger.warning(f"{indent_str}[OBJECT_INSPECTION] ===== {obj_name} COMPLETE INSPECTION =====")
+        
+        if obj is None:
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] {obj_name} is None")
+            return
+        
+        try:
+            # Log basic object info
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Object Type: {type(obj)}")
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Object Class: {obj.__class__}")
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Base Address: {hex(obj.base_address) if hasattr(obj, 'base_address') else 'N/A'}")
+            
+            # Log object hierarchy
+            mro = getattr(obj.__class__, '__mro__', [])
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Class Hierarchy: {[cls.__name__ for cls in mro]}")
+            
+            # Get all attributes and methods
+            all_attrs = dir(obj)
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Total Attributes/Methods: {len(all_attrs)}")
+            
+            # Separate methods from properties
+            methods = []
+            properties = []
+            
+            for attr_name in all_attrs:
+                if attr_name.startswith('_'):
+                    continue  # Skip private/protected
+                
+                try:
+                    attr = getattr(obj, attr_name)
+                    if callable(attr):
+                        methods.append(attr_name)
+                    else:
+                        properties.append(attr_name)
+                except Exception:
+                    logger.warning(f"{indent_str}[OBJECT_INSPECTION] Could not access attribute: {attr_name}")
+            
+            # Log properties first
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] --- PROPERTIES ({len(properties)}) ---")
+            for prop_name in sorted(properties):
+                try:
+                    value = getattr(obj, prop_name)
+                    logger.warning(f"{indent_str}[OBJECT_INSPECTION] Property {prop_name}: {value} (type: {type(value)})")
+                except Exception as e:
+                    logger.warning(f"{indent_str}[OBJECT_INSPECTION] Property {prop_name}: <Error: {e}>")
+            
+            # Log and call all async methods
+            logger.warning(f"{indent_str}[OBJECT_INSPECTION] --- ASYNC METHODS ({len(methods)}) ---")
+            for method_name in sorted(methods):
+                try:
+                    method = getattr(obj, method_name)
+                    if inspect.iscoroutinefunction(method):
+                        # Try to call the async method
+                        try:
+                            result = await method()
+                            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Method {method_name}(): {result} (type: {type(result)})")
+                            
+                            # If result is an object, inspect it briefly
+                            if hasattr(result, '__dict__') or hasattr(result, 'base_address'):
+                                logger.warning(f"{indent_str}[OBJECT_INSPECTION]   -> {method_name}() returned object: {type(result)}")
+                        except Exception as e:
+                            logger.warning(f"{indent_str}[OBJECT_INSPECTION] Method {method_name}(): <Error: {e}>")
+                    else:
+                        logger.warning(f"{indent_str}[OBJECT_INSPECTION] Method {method_name}: <Not async or not callable>")
+                except Exception as e:
+                    logger.warning(f"{indent_str}[OBJECT_INSPECTION] Could not inspect method {method_name}: {e}")
+            
+            # Check for __dict__ and __slots__
+            if hasattr(obj, '__dict__'):
+                logger.warning(f"{indent_str}[OBJECT_INSPECTION] --- __dict__ CONTENTS ---")
+                for key, value in obj.__dict__.items():
+                    logger.warning(f"{indent_str}[OBJECT_INSPECTION] __dict__.{key}: {value} (type: {type(value)})")
+            
+            if hasattr(obj, '__slots__'):
+                logger.warning(f"{indent_str}[OBJECT_INSPECTION] --- __slots__ CONTENTS ---")
+                logger.warning(f"{indent_str}[OBJECT_INSPECTION] __slots__: {obj.__slots__}")
+                
+        except Exception as e:
+            logger.error(f"{indent_str}[OBJECT_INSPECTION] Error during complete inspection: {e}", exc_info=True)
+        
+        logger.warning(f"{indent_str}[OBJECT_INSPECTION] ===== END {obj_name} INSPECTION =====")
+    # </editor-fold>
+
+    # <editor-fold desc="Quest/Goal Change Detection">
+    async def _check_quest_goal_changes(self, context: str = "") -> bool:
+        """
+        Check if the current quest ID, goal ID, or goal type has changed.
+        Returns True if any changes were detected, False otherwise.
+        """
+        try:
+            logger.debug(f"[CHANGE_DETECTION] Checking quest/goal changes - Context: {context}")
+            
+            # Get current quest manager state
+            quest_manager = await self.client.quest_manager()
+            character_registry = await self.client.character_registry()
+            
+            current_quest_id = await character_registry.active_quest_id()
+            
+            if not current_quest_id:
+                logger.warning(f"[CHANGE_DETECTION] No active quest ID found - Context: {context}")
+                if self.current_quest_id is not None:
+                    logger.error(f"[CHANGE_DETECTION] Quest ID changed from {self.current_quest_id} to None!")
+                    self.current_quest_id = None
+                    self.current_goal_id = None
+                    self.current_goal_type = None
+                    return True
+                return False
+            
+            # Get current goal information
+            all_quests = await quest_manager.quest_data()
+            active_quest = all_quests.get(current_quest_id)
+            
+            current_goal_id = None
+            current_goal_type = None
+            
+            if active_quest:
+                on_screen_text = await Utils.get_on_screen_goal_text(self.client)
+                all_goals = await active_quest.goal_data()
+                current_goal_id, current_goal = await self._find_goal_by_text_matching(on_screen_text, all_goals)
+                
+                if current_goal:
+                    current_goal_type = await current_goal.goal_type()
+            
+            # Check for changes
+            quest_id_changed = self.current_quest_id != current_quest_id
+            goal_id_changed = self.current_goal_id != current_goal_id
+            goal_type_changed = self.current_goal_type != current_goal_type
+            
+            any_changes = quest_id_changed or goal_id_changed or goal_type_changed
+            
+            # Log current state
+            logger.info(f"[CHANGE_DETECTION] Context: {context}")
+            logger.info(f"[CHANGE_DETECTION] Current State -> Quest ID: {current_quest_id}, Goal ID: {current_goal_id}, Goal Type: {current_goal_type.name if current_goal_type else 'None'}")
+            logger.info(f"[CHANGE_DETECTION] Previous State -> Quest ID: {self.current_quest_id}, Goal ID: {self.current_goal_id}, Goal Type: {self.current_goal_type.name if self.current_goal_type else 'None'}")
+            
+            if any_changes:
+                logger.warning(f"[CHANGE_DETECTION] CHANGES DETECTED - Context: {context}")
+                
+                if quest_id_changed:
+                    logger.warning(f"[CHANGE_DETECTION] Quest ID changed: {self.current_quest_id} -> {current_quest_id}")
+                    if active_quest:
+                        quest_name = await Utils.translate_lang_key(self.client, await active_quest.name_lang_key())
+                        logger.warning(f"[CHANGE_DETECTION] New quest name: {quest_name}")
+                
+                if goal_id_changed:
+                    logger.warning(f"[CHANGE_DETECTION] Goal ID changed: {self.current_goal_id} -> {current_goal_id}")
+                
+                if goal_type_changed:
+                    old_type_name = self.current_goal_type.name if self.current_goal_type else 'None'
+                    new_type_name = current_goal_type.name if current_goal_type else 'None'
+                    logger.warning(f"[CHANGE_DETECTION] Goal Type changed: {old_type_name} -> {new_type_name}")
+                
+                # Update stored values
+                self.current_quest_id = current_quest_id
+                self.current_goal_id = current_goal_id
+                self.current_goal_type = current_goal_type
+                
+                # Log the re-evaluation details
+                await self._log_quest_reevaluation(active_quest, current_quest_id, current_goal_id, current_goal)
+                
+                return True
+            else:
+                logger.debug(f"[CHANGE_DETECTION] No changes detected - Context: {context}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[CHANGE_DETECTION] Error checking quest/goal changes - Context: {context}: {e}", exc_info=True)
+            return False
+
+    async def _log_quest_reevaluation(self, active_quest, quest_id, goal_id, goal):
+        """Log detailed information about quest re-evaluation"""
+        try:
+            logger.warning("[RE_EVALUATION] ===== QUEST/GOAL RE-EVALUATION =====")
+            if active_quest:
+                quest_name = await Utils.translate_lang_key(self.client, await active_quest.name_lang_key())
+                logger.warning(f"[RE_EVALUATION] New Quest: {quest_name} (ID: {quest_id})")
+                
+                # Complete QuestData inspection
+                await self._inspect_object_completely(active_quest, f"QuestData_{quest_id}", 2)
+                
+                if goal:
+                    goal_name = await Utils.translate_lang_key(self.client, await goal.name_lang_key())
+                    goal_type = await goal.goal_type()
+                    goal_destination = await goal.goal_destination_zone()
+                    goal_status = await goal.goal_status()
+                    
+                    logger.warning(f"[RE_EVALUATION] New Goal: {goal_name} (ID: {goal_id})")
+                    logger.warning(f"[RE_EVALUATION] Goal Type: {goal_type.name}")
+                    logger.warning(f"[RE_EVALUATION] Goal Destination: {goal_destination}")
+                    logger.warning(f"[RE_EVALUATION] Goal Status: {'Complete' if goal_status else 'Incomplete'}")
+                    
+                    # Log handler that would be used
+                    handler_method = self.goal_handlers.get(goal_type, self._handle_unimplemented_goal)
+                    handler_name = handler_method.__name__ if handler_method else "unknown"
+                    logger.warning(f"[RE_EVALUATION] Handler Method: {handler_name}")
+                    
+                    # Complete GoalData inspection
+                    await self._inspect_object_completely(goal, f"GoalData_{goal_id}", 2)
+                    
+                    # Deep madlib inspection
+                    madlib_block = await goal.madlib_block()
+                    if madlib_block:
+                        logger.warning("[RE_EVALUATION] Madlib Basic Entries:")
+                        entries = await madlib_block.entries()
+                        for i, entry in enumerate(entries):
+                            identifier = await entry.identifier()
+                            data_str = await entry.maybe_data_str()
+                            # identifier is a field name (like "NAME", "LOCATION"), not a lang key - don't translate it
+                            # data_str is the actual lang key that should be translated
+                            translated_data = await Utils.translate_lang_key(self.client, data_str) if data_str else "None"
+                            logger.warning(f"[RE_EVALUATION]   - {identifier}: {translated_data}")
+                        
+                        # Complete MadlibBlock inspection
+                        await self._inspect_object_completely(madlib_block, f"MadlibBlock_{goal_id}", 2)
+                        
+                        # Inspect each MadlibEntry
+                        for i, entry in enumerate(entries):
+                            await self._inspect_object_completely(entry, f"MadlibEntry_{i}_{goal_id}", 4)
+                    
+                    # Inspect ClientTagList if available
+                    client_tags = await goal.client_tag_list()
+                    if client_tags:
+                        await self._inspect_object_completely(client_tags, f"ClientTagList_{goal_id}", 2)
+                
+            logger.warning("[RE_EVALUATION] =====================================")
+        except Exception as e:
+            logger.error(f"[RE_EVALUATION] Error logging quest re-evaluation: {e}", exc_info=True)
+    # </editor-fold>
+
     async def run(self):
+        # Check for quest/goal changes at the start of run cycle
+        logger.info("[RUN] Starting quest processing cycle")
+        if await self._check_quest_goal_changes("run_start"):
+            logger.warning("[RUN] Quest/goal changes detected at start, restarting run cycle")
+            return
+        
         # Handle any dialogue that might be on screen from previous quest completion
         logger.debug("Checking for dialogue at start of quest processing cycle...")
         await self._handle_dialogue()
+        
+        # Check for changes after dialogue handling
+        if await self._check_quest_goal_changes("after_initial_dialogue"):
+            logger.warning("[RUN] Quest/goal changes detected after initial dialogue, restarting run cycle")
+            return
         
         # Wait for player to be in a free state before quest detection
         logger.debug("Waiting for free state before quest detection...")
@@ -892,24 +1227,33 @@ class BestQuest:
         # Handle any remaining player state issues
         await self._check_and_handle_player_state()
         
-        quest_manager = await self.client.quest_manager()
-        character_registry = await self.client.character_registry()
-
-        active_quest_id = await character_registry.active_quest_id()
-        if not active_quest_id:
-            logger.warning("No active quest is being tracked. Cannot proceed.")
+        # Check for changes after state handling
+        if await self._check_quest_goal_changes("after_state_handling"):
+            logger.warning("[RUN] Quest/goal changes detected after state handling, restarting run cycle")
             return
+        
+        try:
+            quest_manager = await self.client.quest_manager()
+            character_registry = await self.client.character_registry()
 
-        all_quests = await quest_manager.quest_data()
-        active_quest = all_quests.get(active_quest_id)
+            active_quest_id = await character_registry.active_quest_id()
+            if not active_quest_id:
+                logger.warning("No active quest is being tracked. Cannot proceed.")
+                return
 
-        if not active_quest:
-            logger.error(f"Tracked quest ID {active_quest_id} not found in quest log.")
+            all_quests = await quest_manager.quest_data()
+            active_quest = all_quests.get(active_quest_id)
+
+            if not active_quest:
+                logger.error(f"Tracked quest ID {active_quest_id} not found in quest log.")
+                return
+
+            on_screen_text = await Utils.get_on_screen_goal_text(self.client)
+            all_goals = await active_quest.goal_data()
+            identified_goal_id, identified_goal = await self._find_goal_by_text_matching(on_screen_text, all_goals)
+        except Exception as e:
+            logger.error(f"[RUN] Error getting quest manager data: {e}", exc_info=True)
             return
-
-        on_screen_text = await Utils.get_on_screen_goal_text(self.client)
-        all_goals = await active_quest.goal_data()
-        identified_goal_id, identified_goal = await self._find_goal_by_text_matching(on_screen_text, all_goals)
 
         # Initial check for blocking UI before starting the main logic
         zone_before_action = await self.client.zone_name()
@@ -921,12 +1265,22 @@ class BestQuest:
         # Check and handle any blocking states
         await self._check_and_handle_player_state()
         
+        # Check for changes after initial setup
+        if await self._check_quest_goal_changes("after_initial_setup"):
+            logger.warning("[RUN] Quest/goal changes detected after initial setup, restarting run cycle")
+            return
+        
         if identified_goal:
             ui_handled = await self._handle_spiral_door(await identified_goal.goal_destination_zone())
             if not ui_handled:
                 ui_handled = await self._handle_sigil_entry()
             # Always check for dialogue after any teleportation or UI interaction
             await self._handle_dialogue()
+            
+            # Check for changes after UI handling
+            if await self._check_quest_goal_changes("after_ui_handling"):
+                logger.warning("[RUN] Quest/goal changes detected after UI handling, restarting run cycle")
+                return
             
             if await self.client.zone_name() != zone_before_action:
                 logger.info("UI handled at start of loop, restarting run.")
@@ -957,7 +1311,17 @@ class BestQuest:
         logger.info(f"Processing active goal of type '{goal_type.name}'...")
         # input("Quest Auditor -> Press Enter to after looking at the type of goal.")
 
+        # Check for changes before executing handler
+        if await self._check_quest_goal_changes("before_handler_execution"):
+            logger.warning("[RUN] Quest/goal changes detected before handler execution, restarting run cycle")
+            return
+
         await handler_method(active_goal)
+
+        # Check for changes after handler execution
+        if await self._check_quest_goal_changes("after_handler_execution"):
+            logger.warning("[RUN] Quest/goal changes detected after handler execution, restarting run cycle")
+            return
 
         # Final check after a handler has run
         if identified_goal:
@@ -965,9 +1329,17 @@ class BestQuest:
             if not ui_handled:
                 ui_handled = await self._handle_sigil_entry()
         
+        # Check for changes after final UI handling
+        if await self._check_quest_goal_changes("after_final_ui"):
+            logger.warning("[RUN] Quest/goal changes detected after final UI handling, restarting run cycle")
+            return
+        
         # Final state check and dialogue handling
         await self._check_and_handle_player_state()
         await self._handle_dialogue()
+        
+        # Final check for changes
+        await self._check_quest_goal_changes("run_end")
 
 
 async def main():
