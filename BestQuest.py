@@ -12,6 +12,7 @@ from wizwalker import Client, ClientHandler, Primitive, Keycode
 
 from QuestDataNest import QuestDatabase
 from WorldsCollide import WorldsCollideTP
+from ShrunkChunk import collect_usage_quest_items
 
 from wizwalker.memory.memory_objects.client_tag_list import ClientTagList
 from wizwalker.memory.memory_objects.quest_data import QuestData
@@ -73,6 +74,7 @@ class PlayerStateManager:
         return current_state == PlayerState.FREE
 
     async def wait_for_free_state(self, timeout: float = None):
+        # TODO: If client ends combat and has dialog we just timeout I think and then continue maybe add logic here for that.
         import time
         start_time = time.time()
         
@@ -841,18 +843,43 @@ class BestQuest:
             logger.error(f"[HANDLER] Error in persona goal handler: {e}", exc_info=True)
 
     async def _handle_usage_goal(self, goal: GoalData):
+        '''   1. First Call: Creates new handler with fresh state tracking
+              2. Subsequent Calls: Reuses existing handler and restores previous progress
+              3. Chunk Processing: Skips already processed chunks, works through remaining ones in optimal
+              order
+              4. Entity Collection: Remembers collected entities with 30-second cooldowns
+              5. Quest Changes: Automatically detects and creates new state for new quests'''
         try:
-            logger.info("Handling USAGE goal.")
+            logger.info("Handling USAGE goal with ShrunkChunk collection system.")
             
-            # Check for changes before travel
-            if await self._check_quest_goal_changes("usage_before_travel"):
-                logger.warning("[HANDLER] Quest/goal changes detected before usage travel, aborting handler")
+            # Check for changes before processing
+            if await self._check_quest_goal_changes("usage_before_processing"):
+                logger.warning("[HANDLER] Quest/goal changes detected before usage processing, aborting handler")
                 return
             
-            await self._travel_to_goal_location(goal)
+            # Get expected zone from goal data for verification
+            expected_zone = await goal.goal_destination_zone()
+            current_zone = await self.client.zone_name()
             
-            # Check for changes after travel
-            await self._check_quest_goal_changes("usage_after_travel")
+            # Verify client is in correct zone
+            if expected_zone and current_zone != expected_zone:
+                logger.warning(f"Client not in expected zone. Expected: {expected_zone}, Current: {current_zone}")
+                logger.info("Usage quest requires manual zone correction. Please move client to correct zone.")
+                return
+            
+            logger.info(f"Client verified in correct zone: {current_zone}")
+            
+            # Call ShrunkChunk collection system
+            logger.info("Starting ShrunkChunk collection process...")
+            success = await collect_usage_quest_items(self.client, [self.client], expected_zone)
+            
+            if success:
+                logger.success("ShrunkChunk collection completed successfully")
+            else:
+                logger.warning("ShrunkChunk collection did not find any items to collect")
+            
+            # Check for changes after processing
+            await self._check_quest_goal_changes("usage_after_processing")
             
         except Exception as e:
             logger.error(f"[HANDLER] Error in usage goal handler: {e}", exc_info=True)
